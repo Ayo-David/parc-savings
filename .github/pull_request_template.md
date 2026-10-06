@@ -14,4 +14,3 @@ Describe behavior, contracts, data, security, and operational impact.
 ## Review and rollout
 
 List dependencies, deployment order, feature flags, monitoring, rollback/forward-fix plan, and required approvals.
-

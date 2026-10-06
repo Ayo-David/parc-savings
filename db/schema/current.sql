@@ -212,7 +212,9 @@ CREATE TYPE public.savings_product_type_enum AS ENUM (
     'REGULAR',
     'TARGET',
     'FIXED_DEPOSIT',
-    'PREMIUM_YIELD'
+    'PREMIUM_YIELD',
+    'ORDINARY',
+    'RECURRING'
 );
 
 
@@ -314,20 +316,14 @@ END $$;
 CREATE FUNCTION public.savings_check_interest_total() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
-DECLARE total NUMERIC(24,8); f fixed_deposits%ROWTYPE;
-BEGIN
- IF NEW.status='SUCCESSFUL' THEN
-  IF NEW.settlement_basis='PREPAID' THEN
-   SELECT * INTO f FROM fixed_deposits WHERE tenant_id=NEW.tenant_id AND id=NEW.fixed_deposit_id;
-   IF NOT FOUND OR f.payout_method<>'UPFRONT' OR f.savings_account_id<>NEW.savings_account_id OR NEW.amount<>f.interest_amount THEN
-    RAISE EXCEPTION 'Prepaid interest must match UPFRONT fixed-deposit contract'; END IF;
-   RETURN NEW;
-  END IF;
-  SELECT sum(allocated_amount) INTO total FROM savings_interest_payment_accruals WHERE tenant_id=NEW.tenant_id AND interest_payment_id=NEW.id;
-  IF total IS NULL OR round(total+NEW.rounding_adjustment,2)<>NEW.amount THEN RAISE EXCEPTION 'Interest payment differs from allocated accruals'; END IF;
- END IF;
- RETURN NEW;
-END $$;
+    DECLARE total bigint;
+    BEGIN
+      IF NEW.status='SUCCESSFUL' AND NEW.settlement_basis='ACCRUED' THEN
+        SELECT sum(allocated_minor) INTO total FROM savings_interest_payment_accruals WHERE tenant_id=NEW.tenant_id AND interest_payment_id=NEW.id;
+        IF total IS NULL OR total+NEW.rounding_adjustment<>NEW.amount THEN RAISE EXCEPTION 'Allocated minor units plus residual must equal posted interest'; END IF;
+      END IF;
+      RETURN NEW;
+    END $$;
 
 
 --
@@ -359,6 +355,91 @@ BEGIN
   RAISE EXCEPTION 'Calculated accrual data is immutable'; END IF;
  RETURN NEW;
 END $$;
+
+
+--
+-- Name: savings_protect_deposit(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.savings_protect_deposit() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+    BEGIN
+      IF TG_OP='DELETE' THEN RAISE EXCEPTION 'Savings deposits cannot be deleted'; END IF;
+      IF OLD.status='SUCCESSFUL' THEN RAISE EXCEPTION 'Successful savings deposits are immutable'; END IF;
+      IF (NEW.tenant_id,NEW.id,NEW.savings_account_id,NEW.customer_id,NEW.amount,NEW.currency,NEW.operation_id,NEW.idempotency_key,NEW.request_hash)
+         IS DISTINCT FROM
+         (OLD.tenant_id,OLD.id,OLD.savings_account_id,OLD.customer_id,OLD.amount,OLD.currency,OLD.operation_id,OLD.idempotency_key,OLD.request_hash)
+      THEN RAISE EXCEPTION 'Savings deposit command identity is immutable'; END IF;
+      RETURN NEW;
+    END $$;
+
+
+--
+-- Name: savings_protect_fd_instruction(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.savings_protect_fd_instruction() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+    BEGIN
+      IF TG_OP='DELETE' THEN RAISE EXCEPTION 'Fixed-deposit instructions cannot be deleted'; END IF;
+      IF (to_jsonb(NEW)-ARRAY['superseded_at']) IS DISTINCT FROM (to_jsonb(OLD)-ARRAY['superseded_at']) OR OLD.superseded_at IS NOT NULL OR NEW.superseded_at IS NULL
+      THEN RAISE EXCEPTION 'Fixed-deposit instruction is immutable except for one-time supersession'; END IF;
+      RETURN NEW;
+    END $$;
+
+
+--
+-- Name: savings_protect_fixed_deposit(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.savings_protect_fixed_deposit() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+    BEGIN
+      IF TG_OP='DELETE' THEN RAISE EXCEPTION 'Fixed deposits cannot be deleted'; END IF;
+      IF OLD.status IN ('ACTIVE','MATURED','LIQUIDATED','RENEWED') AND
+        (NEW.tenant_id,NEW.id,NEW.savings_account_id,NEW.customer_id,NEW.principal_amount,NEW.currency,NEW.interest_rate,NEW.tenure_days,NEW.start_date,NEW.maturity_date,NEW.product_version_id,NEW.fixed_deposit_rate_id,NEW.contract_reference,NEW.accepted_at,NEW.accepted_terms_hash,NEW.terms_snapshot,NEW.day_count_basis,NEW.compounding_method,NEW.early_liquidation_allowed,NEW.early_liquidation_penalty_rate,NEW.maturity_instruction_cutoff_days,NEW.placement_idempotency_key,NEW.placement_request_hash)
+        IS DISTINCT FROM
+        (OLD.tenant_id,OLD.id,OLD.savings_account_id,OLD.customer_id,OLD.principal_amount,OLD.currency,OLD.interest_rate,OLD.tenure_days,OLD.start_date,OLD.maturity_date,OLD.product_version_id,OLD.fixed_deposit_rate_id,OLD.contract_reference,OLD.accepted_at,OLD.accepted_terms_hash,OLD.terms_snapshot,OLD.day_count_basis,OLD.compounding_method,OLD.early_liquidation_allowed,OLD.early_liquidation_penalty_rate,OLD.maturity_instruction_cutoff_days,OLD.placement_idempotency_key,OLD.placement_request_hash)
+      THEN RAISE EXCEPTION 'Active fixed-deposit contract is immutable'; END IF;
+      IF OLD.status IN ('MATURED','LIQUIDATED','RENEWED','CANCELLED','WITHDRAWN') AND NEW.status<>OLD.status THEN RAISE EXCEPTION 'Terminal fixed-deposit status is immutable'; END IF;
+      IF NEW.status<>OLD.status AND NOT ((OLD.status='PENDING' AND NEW.status IN ('ACTIVE','CANCELLED')) OR (OLD.status='ACTIVE' AND NEW.status IN ('MATURED','LIQUIDATED','RENEWED','CANCELLED'))) THEN RAISE EXCEPTION 'Invalid fixed-deposit transition'; END IF;
+      IF NEW.aggregate_version<=OLD.aggregate_version THEN NEW.aggregate_version=OLD.aggregate_version+1; END IF;
+      RETURN NEW;
+    END $$;
+
+
+--
+-- Name: savings_protect_goal(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.savings_protect_goal() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+    BEGIN
+      IF TG_OP='DELETE' THEN RAISE EXCEPTION 'Savings goals cannot be deleted'; END IF;
+      IF (NEW.tenant_id,NEW.id,NEW.savings_account_id,NEW.customer_id,NEW.target_amount,NEW.currency,NEW.target_date,NEW.product_terms_hash,NEW.partial_withdrawal_limit_rate,NEW.partial_withdrawal_limit_count,NEW.withdrawn_interest_forfeiture,NEW.break_forfeits_all_interest,NEW.creation_idempotency_key,NEW.creation_request_hash)
+         IS DISTINCT FROM (OLD.tenant_id,OLD.id,OLD.savings_account_id,OLD.customer_id,OLD.target_amount,OLD.currency,OLD.target_date,OLD.product_terms_hash,OLD.partial_withdrawal_limit_rate,OLD.partial_withdrawal_limit_count,OLD.withdrawn_interest_forfeiture,OLD.break_forfeits_all_interest,OLD.creation_idempotency_key,OLD.creation_request_hash)
+      THEN RAISE EXCEPTION 'Savings goal contract is immutable'; END IF;
+      IF OLD.status<>'ACTIVE' AND NEW.status<>OLD.status THEN RAISE EXCEPTION 'Terminal savings goal status is immutable'; END IF;
+      RETURN NEW;
+    END $$;
+
+
+--
+-- Name: savings_protect_goal_final(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.savings_protect_goal_final() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+    BEGIN
+      IF TG_OP='DELETE' THEN RAISE EXCEPTION 'Final goal operations cannot be deleted'; END IF;
+      IF OLD.status='SUCCESSFUL' THEN RAISE EXCEPTION 'Successful goal operations are immutable'; END IF;
+      RETURN NEW;
+    END $$;
 
 
 --
@@ -396,15 +477,12 @@ END $$;
 CREATE FUNCTION public.savings_protect_version() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
-BEGIN
- IF TG_OP='DELETE' OR (TG_OP='UPDATE' AND OLD.status='PUBLISHED') THEN
-  RAISE EXCEPTION 'Published versions cannot be changed/deleted; publish a new version';
- END IF;
- IF TG_OP='UPDATE' AND (NEW.tenant_id<>OLD.tenant_id OR NEW.id<>OLD.id OR NEW.savings_product_id<>OLD.savings_product_id) THEN
-  RAISE EXCEPTION 'Version identity is immutable';
- END IF;
- RETURN NEW;
-END $$;
+    BEGIN
+      IF TG_OP='DELETE' THEN RAISE EXCEPTION 'Savings product versions cannot be deleted'; END IF;
+      IF OLD.status IN ('PUBLISHED','RETIRED') AND NOT (OLD.status='PUBLISHED' AND NEW.status='RETIRED' AND NEW.is_current=false AND (to_jsonb(NEW)-ARRAY['status','is_current','effective_to','updated_at']::text[])=(to_jsonb(OLD)-ARRAY['status','is_current','effective_to','updated_at']::text[])) THEN RAISE EXCEPTION 'Published savings product versions are immutable'; END IF;
+      IF (NEW.tenant_id,NEW.id,NEW.savings_product_id,NEW.version_number) IS DISTINCT FROM (OLD.tenant_id,OLD.id,OLD.savings_product_id,OLD.version_number) THEN RAISE EXCEPTION 'Version identity is immutable'; END IF;
+      RETURN NEW;
+    END $$;
 
 
 --
@@ -428,6 +506,23 @@ BEGIN
  IF TG_OP='DELETE' THEN RETURN OLD; END IF;
  RETURN NEW;
 END $$;
+
+
+--
+-- Name: savings_protect_withdrawal(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.savings_protect_withdrawal() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+    BEGIN
+      IF TG_OP='DELETE' THEN RAISE EXCEPTION 'Savings withdrawals cannot be deleted'; END IF;
+      IF OLD.status='SUCCESSFUL' THEN RAISE EXCEPTION 'Successful savings withdrawals are immutable'; END IF;
+      IF (NEW.tenant_id,NEW.id,NEW.savings_account_id,NEW.customer_id,NEW.amount,NEW.currency,NEW.operation_id,NEW.idempotency_key,NEW.request_hash)
+         IS DISTINCT FROM (OLD.tenant_id,OLD.id,OLD.savings_account_id,OLD.customer_id,OLD.amount,OLD.currency,OLD.operation_id,OLD.idempotency_key,OLD.request_hash)
+      THEN RAISE EXCEPTION 'Savings withdrawal command identity is immutable'; END IF;
+      RETURN NEW;
+    END $$;
 
 
 --
@@ -469,25 +564,22 @@ END $$;
 CREATE FUNCTION public.savings_validate_account() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
-DECLARE v savings_product_versions%ROWTYPE;
-BEGIN
- IF TG_OP='UPDATE' THEN
-  IF (NEW.tenant_id,NEW.id,NEW.customer_id,NEW.currency,NEW.savings_product_id,NEW.product_version_id,
-      NEW.ledger_entity_id,NEW.ledger_book_id,NEW.ledger_account_id)
-     IS DISTINCT FROM (OLD.tenant_id,OLD.id,OLD.customer_id,OLD.currency,OLD.savings_product_id,OLD.product_version_id,
-      OLD.ledger_entity_id,OLD.ledger_book_id,OLD.ledger_account_id) THEN
-   RAISE EXCEPTION 'Account identity/contract/ledger binding is immutable';
-  END IF;
-  NEW.version=OLD.version+1;
- ELSE
-  SELECT * INTO v FROM savings_product_versions WHERE tenant_id=NEW.tenant_id AND id=NEW.product_version_id FOR SHARE;
-  IF NOT FOUND OR v.status<>'PUBLISHED' OR now()<v.effective_from OR (v.effective_to IS NOT NULL AND now()>=v.effective_to) THEN
-   RAISE EXCEPTION 'Account needs an eligible published product version';
-  END IF;
-  IF NEW.held_balance<>0 THEN RAISE EXCEPTION 'Initial held balance must be zero'; END IF;
- END IF;
- RETURN NEW;
-END $$;
+    DECLARE v savings_product_versions%ROWTYPE;
+    BEGIN
+      IF TG_OP='UPDATE' THEN
+        IF (NEW.tenant_id,NEW.id,NEW.customer_id,NEW.currency,NEW.savings_product_id,NEW.product_version_id,NEW.product_type,NEW.ledger_entity_id,NEW.ledger_book_id,NEW.ledger_account_id,NEW.opening_sequence,NEW.opening_idempotency_key,NEW.opening_request_hash)
+           IS DISTINCT FROM (OLD.tenant_id,OLD.id,OLD.customer_id,OLD.currency,OLD.savings_product_id,OLD.product_version_id,OLD.product_type,OLD.ledger_entity_id,OLD.ledger_book_id,OLD.ledger_account_id,OLD.opening_sequence,OLD.opening_idempotency_key,OLD.opening_request_hash)
+        THEN RAISE EXCEPTION 'Account identity/contract/ledger binding is immutable'; END IF;
+        NEW.version=OLD.version+1;
+      ELSE
+        SELECT * INTO v FROM savings_product_versions WHERE tenant_id=NEW.tenant_id AND id=NEW.product_version_id FOR SHARE;
+        IF NOT FOUND OR v.savings_product_id<>NEW.savings_product_id OR v.product_type NOT IN ('ORDINARY','TARGET','FIXED_DEPOSIT') OR v.currency<>NEW.currency OR v.status<>'PUBLISHED' OR NOT v.is_current OR now()<v.effective_from OR (v.effective_to IS NOT NULL AND now()>=v.effective_to)
+        THEN RAISE EXCEPTION 'Account needs a current published supported savings product version'; END IF;
+        IF NEW.held_balance<>0 OR NEW.current_balance<>0 THEN RAISE EXCEPTION 'Initial account balances must be zero'; END IF;
+        IF NEW.product_type<>v.product_type THEN RAISE EXCEPTION 'Account product type must match its version'; END IF;
+      END IF;
+      RETURN NEW;
+    END $$;
 
 
 --
@@ -523,16 +615,16 @@ END $$;
 CREATE FUNCTION public.savings_validate_allocation() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
-DECLARE p savings_interest_payments%ROWTYPE; a savings_interest_accruals%ROWTYPE;
-BEGIN
- SELECT * INTO p FROM savings_interest_payments WHERE tenant_id=NEW.tenant_id AND id=NEW.interest_payment_id FOR UPDATE;
- IF NOT FOUND OR p.settlement_basis<>'ACCRUED' OR p.status IN ('SUCCESSFUL','REVERSED','CANCELLED') THEN RAISE EXCEPTION 'Payment allocation target unavailable'; END IF;
- SELECT * INTO a FROM savings_interest_accruals WHERE tenant_id=NEW.tenant_id AND id=NEW.interest_accrual_id FOR UPDATE;
- IF NOT FOUND OR NOT a.posted OR a.savings_account_id<>p.savings_account_id OR a.currency<>p.currency
-    OR a.accrual_date<p.payment_period_start OR a.accrual_date>p.payment_period_end OR NEW.allocated_amount<>a.interest_amount THEN
-  RAISE EXCEPTION 'Accrual allocation must match posted accrual/account/currency/period/amount'; END IF;
- RETURN NEW;
-END $$;
+    DECLARE p savings_interest_payments%ROWTYPE; a savings_interest_accruals%ROWTYPE;
+    BEGIN
+      SELECT * INTO p FROM savings_interest_payments WHERE tenant_id=NEW.tenant_id AND id=NEW.interest_payment_id FOR UPDATE;
+      SELECT * INTO a FROM savings_interest_accruals WHERE tenant_id=NEW.tenant_id AND id=NEW.interest_accrual_id FOR UPDATE;
+      IF p.id IS NULL OR a.id IS NULL OR p.settlement_basis<>'ACCRUED' OR p.status IN ('SUCCESSFUL','REVERSED','CANCELLED') OR a.posted
+        OR a.savings_account_id<>p.savings_account_id OR a.currency<>p.currency OR a.accrual_date<p.payment_period_start OR a.accrual_date>p.payment_period_end
+        OR NEW.allocated_unrounded<>a.interest_amount OR NEW.allocated_minor<>(CASE WHEN a.interest_amount-floor(a.interest_amount)=0.5 THEN floor(a.interest_amount)+mod(floor(a.interest_amount),2) ELSE round(a.interest_amount) END)::bigint
+      THEN RAISE EXCEPTION 'Interest allocation does not match eligible accrual'; END IF;
+      RETURN NEW;
+    END $$;
 
 
 --
@@ -560,27 +652,28 @@ END $$;
 CREATE FUNCTION public.savings_validate_fixed_deposit() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
-DECLARE a savings_accounts%ROWTYPE; v savings_product_versions%ROWTYPE; r fixed_deposit_rates%ROWTYPE;
-BEGIN
- IF TG_OP='DELETE' THEN RAISE EXCEPTION 'FD contracts cannot be deleted'; END IF;
- IF TG_OP='UPDATE' THEN
-  IF (to_jsonb(NEW)-ARRAY['status','ledger_transaction_id','matured_at','withdrawn_at','updated_at','updated_by']) IS DISTINCT FROM
-     (to_jsonb(OLD)-ARRAY['status','ledger_transaction_id','matured_at','withdrawn_at','updated_at','updated_by']) THEN
-   RAISE EXCEPTION 'FD contract terms are immutable'; END IF;
-  IF OLD.status IN ('WITHDRAWN','RENEWED','CANCELLED','LIQUIDATED') THEN RAISE EXCEPTION 'Terminal FD cannot change'; END IF;
- ELSE
-  SELECT * INTO a FROM savings_accounts WHERE tenant_id=NEW.tenant_id AND id=NEW.savings_account_id;
-  SELECT * INTO v FROM savings_product_versions WHERE tenant_id=NEW.tenant_id AND id=NEW.product_version_id;
-  SELECT * INTO r FROM fixed_deposit_rates WHERE tenant_id=NEW.tenant_id AND id=NEW.fixed_deposit_rate_id;
-  IF a.id IS NULL OR v.id IS NULL OR r.id IS NULL OR a.product_version_id<>NEW.product_version_id OR v.product_type<>'FIXED_DEPOSIT'
-     OR r.product_version_id<>NEW.product_version_id OR r.tenure_days<>NEW.tenure_days OR r.interest_rate<>NEW.interest_rate
-     OR NEW.principal_amount<r.minimum_amount OR (r.maximum_amount IS NOT NULL AND NEW.principal_amount>=r.maximum_amount)
-     OR NEW.accepted_at<r.effective_from OR (r.effective_to IS NOT NULL AND NEW.accepted_at>=r.effective_to) THEN
-   RAISE EXCEPTION 'FD contract does not match account/product/rate/tenure/amount/effective period'; END IF;
- END IF;
- IF NEW.status<>'PENDING' AND NEW.status<>'CANCELLED' AND NEW.ledger_transaction_id IS NULL THEN RAISE EXCEPTION 'Funded FD requires ledger posting'; END IF;
- RETURN NEW;
-END $$;
+    DECLARE a savings_accounts%ROWTYPE; v savings_product_versions%ROWTYPE; r fixed_deposit_rates%ROWTYPE;
+    BEGIN
+      IF TG_OP='DELETE' THEN RAISE EXCEPTION 'FD contracts cannot be deleted'; END IF;
+      IF TG_OP='UPDATE' THEN
+        IF (to_jsonb(NEW)-ARRAY['status','interest_amount','maturity_amount','ledger_transaction_id','ledger_journal_id','ledger_request_hash','ledger_posted_at','matured_at','withdrawn_at','updated_at','updated_by','aggregate_version']) IS DISTINCT FROM
+           (to_jsonb(OLD)-ARRAY['status','interest_amount','maturity_amount','ledger_transaction_id','ledger_journal_id','ledger_request_hash','ledger_posted_at','matured_at','withdrawn_at','updated_at','updated_by','aggregate_version'])
+        THEN RAISE EXCEPTION 'FD contract terms are immutable'; END IF;
+        IF OLD.status IN ('WITHDRAWN','RENEWED','CANCELLED','LIQUIDATED','MATURED') THEN RAISE EXCEPTION 'Terminal FD cannot change'; END IF;
+      ELSE
+        SELECT * INTO a FROM savings_accounts WHERE tenant_id=NEW.tenant_id AND id=NEW.savings_account_id;
+        SELECT * INTO v FROM savings_product_versions WHERE tenant_id=NEW.tenant_id AND id=NEW.product_version_id;
+        SELECT * INTO r FROM fixed_deposit_rates WHERE tenant_id=NEW.tenant_id AND id=NEW.fixed_deposit_rate_id;
+        IF a.id IS NULL OR v.id IS NULL OR r.id IS NULL OR a.product_version_id<>NEW.product_version_id OR v.product_type<>'FIXED_DEPOSIT'
+           OR r.product_version_id<>NEW.product_version_id OR r.interest_rate<>NEW.interest_rate
+           OR NEW.tenure_days<(v.terms->>'minimumTenureDays')::integer OR NEW.tenure_days>(v.terms->>'maximumTenureDays')::integer
+           OR NEW.principal_amount<r.minimum_amount OR (r.maximum_amount IS NOT NULL AND NEW.principal_amount>r.maximum_amount)
+           OR NEW.accepted_at<r.effective_from OR (r.effective_to IS NOT NULL AND NEW.accepted_at>=r.effective_to)
+        THEN RAISE EXCEPTION 'FD contract does not match account/product/rate/tenure/amount/effective period'; END IF;
+      END IF;
+      IF NEW.status NOT IN ('PENDING','CANCELLED') AND NEW.ledger_transaction_id IS NULL THEN RAISE EXCEPTION 'Funded FD requires ledger posting'; END IF;
+      RETURN NEW;
+    END $$;
 
 
 --
@@ -688,6 +781,60 @@ END $$;
 
 
 --
+-- Name: savings_validate_recurring_execution(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.savings_validate_recurring_execution() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+    DECLARE p savings_recurring_plans%ROWTYPE; d savings_deposits%ROWTYPE;
+    BEGIN
+      IF TG_OP='DELETE' THEN RAISE EXCEPTION 'Recurring executions cannot be deleted'; END IF;
+      SELECT * INTO p FROM savings_recurring_plans WHERE tenant_id=NEW.tenant_id AND id=NEW.recurring_plan_id;
+      IF NOT FOUND OR NEW.amount<>p.amount THEN RAISE EXCEPTION 'Execution must match recurring plan'; END IF;
+      IF NEW.deposit_id IS NOT NULL THEN
+        SELECT * INTO d FROM savings_deposits WHERE tenant_id=NEW.tenant_id AND id=NEW.deposit_id;
+        IF NOT FOUND OR d.savings_account_id<>p.savings_account_id OR d.customer_id<>p.customer_id OR d.amount<>NEW.amount OR d.currency<>p.currency OR d.ledger_transaction_id IS DISTINCT FROM NEW.ledger_transaction_id
+        THEN RAISE EXCEPTION 'Recurring execution deposit evidence mismatch'; END IF;
+      END IF;
+      RETURN NEW;
+    END $$;
+
+
+--
+-- Name: savings_validate_recurring_plan(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.savings_validate_recurring_plan() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+    DECLARE a savings_accounts%ROWTYPE; g savings_goals%ROWTYPE;
+    BEGIN
+      IF TG_OP='DELETE' THEN RAISE EXCEPTION 'Recurring plans cannot be deleted'; END IF;
+      IF TG_OP='INSERT' OR (NEW.status='ACTIVE' AND OLD.status<>'ACTIVE') THEN
+        SELECT * INTO a FROM savings_accounts WHERE tenant_id=NEW.tenant_id AND id=NEW.savings_account_id;
+        IF NOT FOUND OR a.customer_id<>NEW.customer_id OR a.currency<>NEW.currency OR a.status<>'ACTIVE' OR a.product_type NOT IN ('ORDINARY','TARGET')
+        THEN RAISE EXCEPTION 'Recurring plan requires an active customer-owned savings account'; END IF;
+        IF (a.product_type='TARGET')<>(NEW.goal_id IS NOT NULL) THEN RAISE EXCEPTION 'Target recurring plan requires goal'; END IF;
+        IF NEW.goal_id IS NOT NULL THEN
+          SELECT * INTO g FROM savings_goals WHERE tenant_id=NEW.tenant_id AND id=NEW.goal_id;
+          IF NOT FOUND OR g.savings_account_id<>NEW.savings_account_id OR g.customer_id<>NEW.customer_id OR g.status<>'ACTIVE'
+          THEN RAISE EXCEPTION 'Recurring goal must be active and match account/customer'; END IF;
+        END IF;
+      END IF;
+      IF TG_OP='UPDATE' THEN
+        IF (NEW.tenant_id,NEW.id,NEW.savings_account_id,NEW.customer_id,NEW.goal_id,NEW.amount,NEW.currency,NEW.frequency,NEW.start_date,NEW.end_date,NEW.max_executions,NEW.source_account_id,NEW.funding_source,NEW.timezone_name,NEW.execution_time,NEW.retry_limit,NEW.creation_idempotency_key,NEW.creation_request_hash,NEW.consent_reference,NEW.schedule_snapshot)
+          IS DISTINCT FROM (OLD.tenant_id,OLD.id,OLD.savings_account_id,OLD.customer_id,OLD.goal_id,OLD.amount,OLD.currency,OLD.frequency,OLD.start_date,OLD.end_date,OLD.max_executions,OLD.source_account_id,OLD.funding_source,OLD.timezone_name,OLD.execution_time,OLD.retry_limit,OLD.creation_idempotency_key,OLD.creation_request_hash,OLD.consent_reference,OLD.schedule_snapshot)
+        THEN RAISE EXCEPTION 'Recurring plan configuration is immutable'; END IF;
+        IF OLD.status IN ('COMPLETED','CANCELLED','EXHAUSTED') AND NEW.status<>OLD.status THEN RAISE EXCEPTION 'Terminal recurring plan is immutable'; END IF;
+        IF NEW.status<>OLD.status AND NOT ((OLD.status='ACTIVE' AND NEW.status IN ('PAUSED','COMPLETED','CANCELLED','EXHAUSTED')) OR (OLD.status='PAUSED' AND NEW.status IN ('ACTIVE','CANCELLED'))) THEN RAISE EXCEPTION 'Invalid recurring plan transition'; END IF;
+        NEW.aggregate_version=OLD.aggregate_version+1;
+      END IF;
+      RETURN NEW;
+    END $$;
+
+
+--
 -- Name: savings_validate_renewal(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -741,6 +888,11 @@ CREATE TABLE public.fixed_deposit_instructions (
     accepted_at timestamp with time zone NOT NULL,
     consent_reference text NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
+    idempotency_key character varying(255),
+    request_hash character(64),
+    correlation_id uuid,
+    superseded_at timestamp with time zone,
+    CONSTRAINT fixed_deposit_instruction_hash CHECK (((request_hash IS NULL) OR (request_hash ~ '^[a-f0-9]{64}$'::text))),
     CONSTRAINT fixed_deposit_instructions_check CHECK (((maturity_action = 'PAYOUT_ALL'::text) OR (renewal_tenure_days IS NOT NULL))),
     CONSTRAINT fixed_deposit_instructions_check1 CHECK (((maturity_action <> 'PAYOUT_ALL'::text) OR (destination_account_id IS NOT NULL))),
     CONSTRAINT fixed_deposit_instructions_instruction_number_check CHECK ((instruction_number > 0)),
@@ -760,7 +912,7 @@ CREATE TABLE public.fixed_deposit_interest_payments (
     tenant_id uuid NOT NULL,
     fixed_deposit_id uuid NOT NULL,
     payment_reference character varying(100) NOT NULL,
-    amount numeric(20,2) NOT NULL,
+    amount bigint NOT NULL,
     currency character(3) DEFAULT 'NGN'::bpchar NOT NULL,
     payment_date date NOT NULL,
     status public.savings_transaction_status_enum DEFAULT 'PENDING'::public.savings_transaction_status_enum NOT NULL,
@@ -777,7 +929,7 @@ CREATE TABLE public.fixed_deposit_interest_payments (
     correlation_id uuid NOT NULL,
     request_id text,
     failure_code text,
-    CONSTRAINT chk_fixed_deposit_interest_amount CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT chk_fixed_deposit_interest_amount CHECK (((amount)::numeric >= (0)::numeric)),
     CONSTRAINT fixed_deposit_interest_payments_check CHECK ((payment_period_end >= payment_period_start)),
     CONSTRAINT fixed_deposit_interest_payments_check1 CHECK ((((status)::text <> 'SUCCESSFUL'::text) OR (ledger_transaction_id IS NOT NULL)))
 );
@@ -795,12 +947,11 @@ CREATE TABLE public.fixed_deposit_liquidations (
     fixed_deposit_id uuid NOT NULL,
     liquidation_reference text NOT NULL,
     status text DEFAULT 'REQUESTED'::text NOT NULL,
-    principal_amount numeric(20,2) NOT NULL,
-    interest_due numeric(20,2) NOT NULL,
-    interest_clawback numeric(20,2) DEFAULT 0 NOT NULL,
-    penalty_amount numeric(20,2) DEFAULT 0 NOT NULL,
-    tax_amount numeric(20,2) DEFAULT 0 NOT NULL,
-    net_payout numeric(20,2) GENERATED ALWAYS AS (((((principal_amount + interest_due) - interest_clawback) - penalty_amount) - tax_amount)) STORED,
+    principal_amount bigint NOT NULL,
+    interest_due bigint NOT NULL,
+    interest_clawback bigint DEFAULT 0 NOT NULL,
+    penalty_amount bigint DEFAULT 0 NOT NULL,
+    tax_amount bigint DEFAULT 0 NOT NULL,
     calculation_snapshot jsonb NOT NULL,
     destination_account_id uuid NOT NULL,
     payment_transaction_id uuid,
@@ -813,16 +964,30 @@ CREATE TABLE public.fixed_deposit_liquidations (
     idempotency_key text NOT NULL,
     correlation_id uuid NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT fixed_deposit_liquidations_check CHECK (((approved_by IS NULL) OR (approved_by <> created_by))),
-    CONSTRAINT fixed_deposit_liquidations_check1 CHECK (((status <> ALL (ARRAY['APPROVED'::text, 'POSTING'::text, 'SUCCESSFUL'::text])) OR ((approved_by IS NOT NULL) AND (approved_at IS NOT NULL)))),
+    net_payout bigint GENERATED ALWAYS AS (((((principal_amount + interest_due) - interest_clawback) - penalty_amount) - tax_amount)) STORED,
+    request_hash character(64),
+    quote_id uuid,
+    quote_hash character(64),
+    quote_expires_at timestamp with time zone,
+    ledger_journal_id uuid,
+    ledger_request_hash character(64),
+    ledger_posted_at timestamp with time zone,
+    authority_type text DEFAULT 'PRODUCT_POLICY'::text NOT NULL,
+    approval_id uuid,
+    CONSTRAINT fixed_deposit_liquidation_approval CHECK (((authority_type <> 'TENANT_APPROVAL'::text) OR (approval_id IS NOT NULL))),
+    CONSTRAINT fixed_deposit_liquidation_authority CHECK ((authority_type = ANY (ARRAY['PRODUCT_POLICY'::text, 'TENANT_APPROVAL'::text]))),
+    CONSTRAINT fixed_deposit_liquidation_authority_evidence CHECK (((status <> ALL (ARRAY['APPROVED'::text, 'POSTING'::text, 'SUCCESSFUL'::text])) OR (authority_type = 'PRODUCT_POLICY'::text) OR ((approved_by IS NOT NULL) AND (approved_at IS NOT NULL)))),
+    CONSTRAINT fixed_deposit_liquidation_maker_checker CHECK (((approved_by IS NULL) OR (approved_by <> created_by))),
+    CONSTRAINT fixed_deposit_liquidation_quote_hash CHECK (((quote_hash IS NULL) OR (quote_hash ~ '^[a-f0-9]{64}$'::text))),
+    CONSTRAINT fixed_deposit_liquidation_request_hash CHECK (((request_hash IS NULL) OR (request_hash ~ '^[a-f0-9]{64}$'::text))),
+    CONSTRAINT fixed_deposit_liquidation_success_evidence CHECK (((status <> 'SUCCESSFUL'::text) OR ((ledger_transaction_id IS NOT NULL) AND (ledger_journal_id IS NOT NULL) AND (ledger_request_hash IS NOT NULL) AND (ledger_posted_at IS NOT NULL) AND (processed_at IS NOT NULL)))),
     CONSTRAINT fixed_deposit_liquidations_check2 CHECK (((status <> 'SUCCESSFUL'::text) OR ((ledger_transaction_id IS NOT NULL) AND (processed_at IS NOT NULL)))),
-    CONSTRAINT fixed_deposit_liquidations_interest_clawback_check CHECK ((interest_clawback >= (0)::numeric)),
-    CONSTRAINT fixed_deposit_liquidations_interest_due_check CHECK ((interest_due >= (0)::numeric)),
-    CONSTRAINT fixed_deposit_liquidations_net_payout_check CHECK ((net_payout >= (0)::numeric)),
-    CONSTRAINT fixed_deposit_liquidations_penalty_amount_check CHECK ((penalty_amount >= (0)::numeric)),
-    CONSTRAINT fixed_deposit_liquidations_principal_amount_check CHECK ((principal_amount > (0)::numeric)),
+    CONSTRAINT fixed_deposit_liquidations_interest_clawback_check CHECK (((interest_clawback)::numeric >= (0)::numeric)),
+    CONSTRAINT fixed_deposit_liquidations_interest_due_check CHECK (((interest_due)::numeric >= (0)::numeric)),
+    CONSTRAINT fixed_deposit_liquidations_penalty_amount_check CHECK (((penalty_amount)::numeric >= (0)::numeric)),
+    CONSTRAINT fixed_deposit_liquidations_principal_amount_check CHECK (((principal_amount)::numeric > (0)::numeric)),
     CONSTRAINT fixed_deposit_liquidations_status_check CHECK ((status = ANY (ARRAY['REQUESTED'::text, 'APPROVED'::text, 'POSTING'::text, 'SUCCESSFUL'::text, 'FAILED'::text, 'REJECTED'::text, 'CANCELLED'::text]))),
-    CONSTRAINT fixed_deposit_liquidations_tax_amount_check CHECK ((tax_amount >= (0)::numeric))
+    CONSTRAINT fixed_deposit_liquidations_tax_amount_check CHECK (((tax_amount)::numeric >= (0)::numeric))
 );
 
 ALTER TABLE ONLY public.fixed_deposit_liquidations FORCE ROW LEVEL SECURITY;
@@ -839,10 +1004,9 @@ CREATE TABLE public.fixed_deposit_maturities (
     instruction_id uuid NOT NULL,
     maturity_reference text NOT NULL,
     status public.savings_transaction_status_enum DEFAULT 'PENDING'::public.savings_transaction_status_enum NOT NULL,
-    principal_amount numeric(20,2) NOT NULL,
-    unpaid_interest numeric(20,2) NOT NULL,
-    tax_amount numeric(20,2) DEFAULT 0 NOT NULL,
-    net_amount numeric(20,2) GENERATED ALWAYS AS (((principal_amount + unpaid_interest) - tax_amount)) STORED,
+    principal_amount bigint NOT NULL,
+    unpaid_interest bigint NOT NULL,
+    tax_amount bigint DEFAULT 0 NOT NULL,
     ledger_transaction_id uuid,
     payment_transaction_id uuid,
     processed_at timestamp with time zone,
@@ -850,14 +1014,70 @@ CREATE TABLE public.fixed_deposit_maturities (
     idempotency_key text NOT NULL,
     correlation_id uuid NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
+    net_amount bigint GENERATED ALWAYS AS (((principal_amount + unpaid_interest) - tax_amount)) STORED,
+    request_hash character(64),
+    ledger_journal_id uuid,
+    ledger_request_hash character(64),
+    ledger_posted_at timestamp with time zone,
+    system_authority text DEFAULT 'SCHEDULED_MATURITY'::text NOT NULL,
     CONSTRAINT fixed_deposit_maturities_check CHECK ((tax_amount <= unpaid_interest)),
     CONSTRAINT fixed_deposit_maturities_check1 CHECK (((status <> 'SUCCESSFUL'::public.savings_transaction_status_enum) OR ((ledger_transaction_id IS NOT NULL) AND (processed_at IS NOT NULL)))),
-    CONSTRAINT fixed_deposit_maturities_principal_amount_check CHECK ((principal_amount > (0)::numeric)),
-    CONSTRAINT fixed_deposit_maturities_tax_amount_check CHECK ((tax_amount >= (0)::numeric)),
-    CONSTRAINT fixed_deposit_maturities_unpaid_interest_check CHECK ((unpaid_interest >= (0)::numeric))
+    CONSTRAINT fixed_deposit_maturities_principal_amount_check CHECK (((principal_amount)::numeric > (0)::numeric)),
+    CONSTRAINT fixed_deposit_maturities_tax_amount_check CHECK (((tax_amount)::numeric >= (0)::numeric)),
+    CONSTRAINT fixed_deposit_maturities_unpaid_interest_check CHECK (((unpaid_interest)::numeric >= (0)::numeric)),
+    CONSTRAINT fixed_deposit_maturity_authority CHECK ((system_authority = 'SCHEDULED_MATURITY'::text)),
+    CONSTRAINT fixed_deposit_maturity_request_hash CHECK (((request_hash IS NULL) OR (request_hash ~ '^[a-f0-9]{64}$'::text))),
+    CONSTRAINT fixed_deposit_maturity_success_evidence CHECK (((status <> 'SUCCESSFUL'::public.savings_transaction_status_enum) OR ((ledger_transaction_id IS NOT NULL) AND (ledger_journal_id IS NOT NULL) AND (ledger_request_hash IS NOT NULL) AND (ledger_posted_at IS NOT NULL) AND (processed_at IS NOT NULL))))
 );
 
 ALTER TABLE ONLY public.fixed_deposit_maturities FORCE ROW LEVEL SECURITY;
+
+
+--
+-- Name: fixed_deposit_quotes; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.fixed_deposit_quotes (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id uuid NOT NULL,
+    customer_id uuid NOT NULL,
+    quote_type text NOT NULL,
+    fixed_deposit_id uuid,
+    product_version_id uuid NOT NULL,
+    principal_minor bigint NOT NULL,
+    currency character(3) NOT NULL,
+    tenure_days integer NOT NULL,
+    interest_rate numeric(18,10) NOT NULL,
+    expected_interest_unrounded numeric(30,12) NOT NULL,
+    expected_interest_minor bigint NOT NULL,
+    penalty_minor bigint DEFAULT 0 NOT NULL,
+    payout_minor bigint NOT NULL,
+    calculation_snapshot jsonb NOT NULL,
+    quote_hash character(64) NOT NULL,
+    request_hash character(64) NOT NULL,
+    idempotency_key character varying(255) NOT NULL,
+    expires_at timestamp with time zone NOT NULL,
+    consumed_at timestamp with time zone,
+    correlation_id uuid NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT fixed_deposit_quotes_calculation_snapshot_check CHECK ((jsonb_typeof(calculation_snapshot) = 'object'::text)),
+    CONSTRAINT fixed_deposit_quotes_check CHECK ((((quote_type = 'PLACEMENT'::text) AND (fixed_deposit_id IS NULL)) OR ((quote_type = 'LIQUIDATION'::text) AND (fixed_deposit_id IS NOT NULL)))),
+    CONSTRAINT fixed_deposit_quotes_check1 CHECK ((expires_at > created_at)),
+    CONSTRAINT fixed_deposit_quotes_check2 CHECK (((consumed_at IS NULL) OR (consumed_at >= created_at))),
+    CONSTRAINT fixed_deposit_quotes_currency_check CHECK ((currency ~ '^[A-Z]{3}$'::text)),
+    CONSTRAINT fixed_deposit_quotes_expected_interest_minor_check CHECK ((expected_interest_minor >= 0)),
+    CONSTRAINT fixed_deposit_quotes_expected_interest_unrounded_check CHECK ((expected_interest_unrounded >= (0)::numeric)),
+    CONSTRAINT fixed_deposit_quotes_interest_rate_check CHECK ((interest_rate >= (0)::numeric)),
+    CONSTRAINT fixed_deposit_quotes_payout_minor_check CHECK ((payout_minor >= 0)),
+    CONSTRAINT fixed_deposit_quotes_penalty_minor_check CHECK ((penalty_minor >= 0)),
+    CONSTRAINT fixed_deposit_quotes_principal_minor_check CHECK ((principal_minor > 0)),
+    CONSTRAINT fixed_deposit_quotes_quote_hash_check CHECK ((quote_hash ~ '^[a-f0-9]{64}$'::text)),
+    CONSTRAINT fixed_deposit_quotes_quote_type_check CHECK ((quote_type = ANY (ARRAY['PLACEMENT'::text, 'LIQUIDATION'::text]))),
+    CONSTRAINT fixed_deposit_quotes_request_hash_check CHECK ((request_hash ~ '^[a-f0-9]{64}$'::text)),
+    CONSTRAINT fixed_deposit_quotes_tenure_days_check CHECK ((tenure_days > 0))
+);
+
+ALTER TABLE ONLY public.fixed_deposit_quotes FORCE ROW LEVEL SECURITY;
 
 
 --
@@ -869,9 +1089,9 @@ CREATE TABLE public.fixed_deposit_rates (
     tenant_id uuid NOT NULL,
     savings_product_id uuid NOT NULL,
     tenure_days integer NOT NULL,
-    interest_rate numeric(10,6) NOT NULL,
-    minimum_amount numeric(20,2) DEFAULT 0 NOT NULL,
-    maximum_amount numeric(20,2),
+    interest_rate numeric(18,10) NOT NULL,
+    minimum_amount bigint DEFAULT 0 NOT NULL,
+    maximum_amount bigint,
     effective_from timestamp with time zone NOT NULL,
     effective_to timestamp with time zone,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
@@ -881,7 +1101,7 @@ CREATE TABLE public.fixed_deposit_rates (
     CONSTRAINT chk_fixed_deposit_rate_dates CHECK (((effective_to IS NULL) OR (effective_to > effective_from))),
     CONSTRAINT chk_fixed_deposit_rate_tenure CHECK ((tenure_days > 0)),
     CONSTRAINT fixed_deposit_rates_check CHECK (((maximum_amount IS NULL) OR (maximum_amount > minimum_amount))),
-    CONSTRAINT fixed_deposit_rates_minimum_amount_check CHECK ((minimum_amount >= (0)::numeric))
+    CONSTRAINT fixed_deposit_rates_minimum_amount_check CHECK (((minimum_amount)::numeric >= (0)::numeric))
 );
 
 ALTER TABLE ONLY public.fixed_deposit_rates FORCE ROW LEVEL SECURITY;
@@ -898,18 +1118,18 @@ CREATE TABLE public.fixed_deposit_renewals (
     previous_maturity_date date NOT NULL,
     new_start_date date NOT NULL,
     new_maturity_date date NOT NULL,
-    principal_amount numeric(20,2) NOT NULL,
-    interest_amount numeric(20,2) DEFAULT 0 NOT NULL,
-    interest_rate numeric(10,6) NOT NULL,
+    principal_amount bigint NOT NULL,
+    interest_amount bigint DEFAULT 0 NOT NULL,
+    interest_rate numeric(18,10) NOT NULL,
     tenure_days integer NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     renewed_fixed_deposit_id uuid NOT NULL,
     renewal_instruction_id uuid NOT NULL,
     ledger_transaction_id uuid NOT NULL,
-    CONSTRAINT chk_fixed_deposit_renewal_amount CHECK ((principal_amount > (0)::numeric)),
+    CONSTRAINT chk_fixed_deposit_renewal_amount CHECK (((principal_amount)::numeric > (0)::numeric)),
     CONSTRAINT chk_fixed_deposit_renewal_dates CHECK ((new_maturity_date > new_start_date)),
     CONSTRAINT chk_fixed_deposit_renewal_rate CHECK ((interest_rate >= (0)::numeric)),
-    CONSTRAINT fixed_deposit_renewals_check CHECK (((tenure_days > 0) AND (interest_amount >= (0)::numeric))),
+    CONSTRAINT fixed_deposit_renewals_check CHECK (((tenure_days > 0) AND ((interest_amount)::numeric >= (0)::numeric))),
     CONSTRAINT fixed_deposit_renewals_check1 CHECK ((new_maturity_date = (new_start_date + tenure_days))),
     CONSTRAINT fixed_deposit_renewals_check2 CHECK ((new_start_date >= previous_maturity_date)),
     CONSTRAINT fixed_deposit_renewals_check3 CHECK ((renewed_fixed_deposit_id <> fixed_deposit_id))
@@ -928,14 +1148,14 @@ CREATE TABLE public.fixed_deposits (
     savings_account_id uuid NOT NULL,
     customer_id uuid NOT NULL,
     deposit_reference character varying(100) NOT NULL,
-    principal_amount numeric(20,2) NOT NULL,
+    principal_amount bigint NOT NULL,
     currency character(3) DEFAULT 'NGN'::bpchar NOT NULL,
-    interest_rate numeric(10,6) NOT NULL,
+    interest_rate numeric(18,10) NOT NULL,
     tenure_days integer NOT NULL,
     start_date date NOT NULL,
     maturity_date date NOT NULL,
-    interest_amount numeric(20,2) DEFAULT 0 NOT NULL,
-    maturity_amount numeric(20,2) NOT NULL,
+    interest_amount numeric(30,12) DEFAULT 0 NOT NULL,
+    maturity_amount bigint NOT NULL,
     payout_method public.fixed_deposit_payout_method_enum DEFAULT 'AT_MATURITY'::public.fixed_deposit_payout_method_enum NOT NULL,
     status public.fixed_deposit_status_enum DEFAULT 'PENDING'::public.fixed_deposit_status_enum NOT NULL,
     source_account_id uuid,
@@ -958,11 +1178,33 @@ CREATE TABLE public.fixed_deposits (
     terms_snapshot jsonb NOT NULL,
     day_count_basis text NOT NULL,
     compounding_method text NOT NULL,
-    CONSTRAINT chk_fixed_deposit_amounts CHECK (((interest_amount >= (0)::numeric) AND (maturity_amount >= principal_amount))),
+    placement_idempotency_key character varying(255),
+    placement_request_hash character(64),
+    correlation_id uuid,
+    ledger_journal_id uuid,
+    ledger_request_hash character(64),
+    ledger_posted_at timestamp with time zone,
+    quote_id uuid,
+    quote_hash character(64),
+    quote_expires_at timestamp with time zone,
+    early_liquidation_allowed boolean DEFAULT true NOT NULL,
+    early_liquidation_penalty_rate numeric(18,10) DEFAULT 0 NOT NULL,
+    maturity_instruction_cutoff_days integer DEFAULT 1 NOT NULL,
+    aggregate_version bigint DEFAULT 1 NOT NULL,
     CONSTRAINT chk_fixed_deposit_dates CHECK ((maturity_date > start_date)),
     CONSTRAINT chk_fixed_deposit_interest CHECK ((interest_rate >= (0)::numeric)),
-    CONSTRAINT chk_fixed_deposit_principal CHECK ((principal_amount > (0)::numeric)),
     CONSTRAINT chk_fixed_deposit_tenure CHECK ((tenure_days > 0)),
+    CONSTRAINT fixed_deposit_activation_evidence CHECK (((status <> 'ACTIVE'::public.fixed_deposit_status_enum) OR ((placement_idempotency_key IS NOT NULL) AND (placement_request_hash IS NOT NULL) AND (correlation_id IS NOT NULL) AND (ledger_transaction_id IS NOT NULL) AND (ledger_journal_id IS NOT NULL) AND (ledger_request_hash IS NOT NULL) AND (ledger_posted_at IS NOT NULL)))),
+    CONSTRAINT fixed_deposit_aggregate_version CHECK ((aggregate_version > 0)),
+    CONSTRAINT fixed_deposit_cutoff CHECK ((maturity_instruction_cutoff_days >= 0)),
+    CONSTRAINT fixed_deposit_ledger_hash CHECK (((ledger_request_hash IS NULL) OR (ledger_request_hash ~ '^[a-f0-9]{64}$'::text))),
+    CONSTRAINT fixed_deposit_liquidation_policy CHECK (((early_liquidation_penalty_rate >= (0)::numeric) AND (early_liquidation_penalty_rate <= (100)::numeric))),
+    CONSTRAINT fixed_deposit_maturity_minor CHECK ((maturity_amount >= principal_amount)),
+    CONSTRAINT fixed_deposit_placement_hash CHECK (((placement_request_hash IS NULL) OR (placement_request_hash ~ '^[a-f0-9]{64}$'::text))),
+    CONSTRAINT fixed_deposit_principal_minor CHECK ((principal_amount > 0)),
+    CONSTRAINT fixed_deposit_quote_evidence CHECK (((quote_id IS NULL) OR ((quote_hash IS NOT NULL) AND (quote_expires_at IS NOT NULL)))),
+    CONSTRAINT fixed_deposit_quote_hash CHECK (((quote_hash IS NULL) OR (quote_hash ~ '^[a-f0-9]{64}$'::text))),
+    CONSTRAINT fixed_deposit_unposted_interest CHECK ((interest_amount >= (0)::numeric)),
     CONSTRAINT fixed_deposits_check CHECK ((maturity_date = (start_date + tenure_days))),
     CONSTRAINT fixed_deposits_check1 CHECK (((previous_fixed_deposit_id IS NULL) OR (previous_fixed_deposit_id <> id))),
     CONSTRAINT fixed_deposits_compounding_method_check CHECK ((compounding_method = ANY (ARRAY['SIMPLE'::text, 'DAILY'::text, 'MONTHLY'::text, 'QUARTERLY'::text, 'ANNUALLY'::text]))),
@@ -1082,15 +1324,15 @@ CREATE TABLE public.savings_account_transactions (
     transaction_reference character varying(100) NOT NULL,
     transaction_type public.savings_account_transaction_type_enum NOT NULL,
     direction public.savings_account_transaction_direction_enum NOT NULL,
-    amount numeric(20,2) NOT NULL,
+    amount bigint NOT NULL,
     currency character(3) DEFAULT 'NGN'::bpchar NOT NULL,
     status public.savings_transaction_status_enum DEFAULT 'SUCCESSFUL'::public.savings_transaction_status_enum NOT NULL,
     channel public.savings_transaction_channel_enum NOT NULL,
     description character varying(500),
-    balance_before numeric(20,2) NOT NULL,
-    balance_after numeric(20,2) NOT NULL,
-    available_balance_before numeric(20,2) NOT NULL,
-    available_balance_after numeric(20,2) NOT NULL,
+    balance_before bigint NOT NULL,
+    balance_after bigint NOT NULL,
+    available_balance_before bigint NOT NULL,
+    available_balance_after bigint NOT NULL,
     payment_transaction_id uuid,
     ledger_transaction_id uuid,
     deposit_id uuid,
@@ -1120,12 +1362,12 @@ CREATE TABLE public.savings_account_transactions (
     leg_code text NOT NULL,
     ledger_entry_id uuid NOT NULL,
     ledger_sequence bigint NOT NULL,
-    CONSTRAINT chk_savings_account_transaction_amount CHECK ((amount > (0)::numeric)),
-    CONSTRAINT chk_savings_account_transaction_available_after CHECK ((available_balance_after >= (0)::numeric)),
+    CONSTRAINT chk_savings_account_transaction_amount CHECK ((amount > 0)),
+    CONSTRAINT chk_savings_account_transaction_available_after CHECK ((available_balance_after >= 0)),
     CONSTRAINT chk_savings_account_transaction_available_balance CHECK (((available_balance_before <= balance_before) AND (available_balance_after <= balance_after))),
-    CONSTRAINT chk_savings_account_transaction_available_before CHECK ((available_balance_before >= (0)::numeric)),
-    CONSTRAINT chk_savings_account_transaction_balance_after CHECK ((balance_after >= (0)::numeric)),
-    CONSTRAINT chk_savings_account_transaction_balance_before CHECK ((balance_before >= (0)::numeric)),
+    CONSTRAINT chk_savings_account_transaction_available_before CHECK ((available_balance_before >= 0)),
+    CONSTRAINT chk_savings_account_transaction_balance_after CHECK ((balance_after >= 0)),
+    CONSTRAINT chk_savings_account_transaction_balance_before CHECK ((balance_before >= 0)),
     CONSTRAINT chk_savings_account_transaction_reversal CHECK (((reversed_transaction_id IS NULL) OR (transaction_type = ANY (ARRAY['REVERSAL'::public.savings_account_transaction_type_enum, 'INTEREST_REVERSAL'::public.savings_account_transaction_type_enum, 'FEE_REVERSAL'::public.savings_account_transaction_type_enum])))),
     CONSTRAINT savings_account_transactions_check CHECK (((ledger_transaction_id IS NOT NULL) AND (processed_at IS NOT NULL))),
     CONSTRAINT savings_account_transactions_check1 CHECK (((transaction_type = ANY (ARRAY['REVERSAL'::public.savings_account_transaction_type_enum, 'INTEREST_REVERSAL'::public.savings_account_transaction_type_enum, 'FEE_REVERSAL'::public.savings_account_transaction_type_enum])) = (reversed_transaction_id IS NOT NULL))),
@@ -1191,13 +1433,12 @@ CREATE TABLE public.savings_accounts (
     account_number character varying(100) NOT NULL,
     currency character(3) DEFAULT 'NGN'::bpchar NOT NULL,
     status public.savings_account_status_enum DEFAULT 'PENDING'::public.savings_account_status_enum NOT NULL,
-    current_balance numeric(20,2) DEFAULT 0 NOT NULL,
-    held_balance numeric(20,2) DEFAULT 0 NOT NULL,
-    available_balance numeric(20,2) GENERATED ALWAYS AS ((current_balance - held_balance)) STORED,
-    accrued_interest numeric(24,8) DEFAULT 0 NOT NULL,
-    total_interest_earned numeric(20,2) DEFAULT 0 NOT NULL,
-    total_deposited numeric(20,2) DEFAULT 0 NOT NULL,
-    total_withdrawn numeric(20,2) DEFAULT 0 NOT NULL,
+    current_balance bigint DEFAULT 0 NOT NULL,
+    held_balance bigint DEFAULT 0 NOT NULL,
+    accrued_interest numeric(30,12) DEFAULT 0 NOT NULL,
+    total_interest_earned bigint DEFAULT 0 NOT NULL,
+    total_deposited bigint DEFAULT 0 NOT NULL,
+    total_withdrawn bigint DEFAULT 0 NOT NULL,
     opened_at timestamp with time zone,
     closed_at timestamp with time zone,
     metadata jsonb DEFAULT '{}'::jsonb NOT NULL,
@@ -1207,24 +1448,43 @@ CREATE TABLE public.savings_accounts (
     updated_by uuid,
     deleted_at timestamp with time zone,
     product_version_id uuid NOT NULL,
-    ledger_entity_id uuid NOT NULL,
-    ledger_book_id uuid NOT NULL,
+    ledger_entity_id uuid,
+    ledger_book_id uuid,
     ledger_account_id uuid NOT NULL,
     ledger_interest_payable_account_id uuid,
     version bigint DEFAULT 0 NOT NULL,
     last_ledger_sequence bigint DEFAULT 0 NOT NULL,
     ledger_synced_at timestamp with time zone,
-    CONSTRAINT chk_savings_account_balance CHECK (((current_balance >= (0)::numeric) AND (available_balance >= (0)::numeric) AND (accrued_interest >= (0)::numeric))),
-    CONSTRAINT chk_savings_account_totals CHECK (((total_deposited >= (0)::numeric) AND (total_withdrawn >= (0)::numeric) AND (total_interest_earned >= (0)::numeric))),
-    CONSTRAINT savings_accounts_check CHECK (((held_balance >= (0)::numeric) AND (held_balance <= current_balance))),
+    available_balance bigint GENERATED ALWAYS AS ((current_balance - held_balance)) STORED,
+    opening_sequence bigint NOT NULL,
+    opening_idempotency_key character varying(255),
+    opening_request_hash character(64),
+    product_type public.savings_product_type_enum NOT NULL,
+    CONSTRAINT chk_savings_account_balance CHECK (((current_balance >= 0) AND (held_balance >= 0) AND (held_balance <= current_balance) AND (available_balance >= 0) AND (accrued_interest >= (0)::numeric))),
+    CONSTRAINT chk_savings_account_totals CHECK (((total_deposited >= 0) AND (total_withdrawn >= 0) AND (total_interest_earned >= 0))),
+    CONSTRAINT savings_account_opening_hash CHECK (((opening_request_hash IS NULL) OR (opening_request_hash ~ '^[a-f0-9]{64}$'::text))),
     CONSTRAINT savings_accounts_check1 CHECK (((closed_at IS NULL) OR (closed_at >= opened_at))),
-    CONSTRAINT savings_accounts_check2 CHECK (((status <> 'CLOSED'::public.savings_account_status_enum) OR ((closed_at IS NOT NULL) AND (current_balance = (0)::numeric) AND (held_balance = (0)::numeric) AND (accrued_interest = (0)::numeric)))),
+    CONSTRAINT savings_accounts_closed_zero CHECK (((status <> 'CLOSED'::public.savings_account_status_enum) OR ((closed_at IS NOT NULL) AND (current_balance = 0) AND (held_balance = 0) AND (accrued_interest = (0)::numeric)))),
     CONSTRAINT savings_accounts_deleted_at_check CHECK ((deleted_at IS NULL)),
     CONSTRAINT savings_accounts_last_ledger_sequence_check CHECK ((last_ledger_sequence >= 0)),
     CONSTRAINT savings_accounts_version_check CHECK ((version >= 0))
 );
 
 ALTER TABLE ONLY public.savings_accounts FORCE ROW LEVEL SECURITY;
+
+
+--
+-- Name: savings_accounts_opening_sequence_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+ALTER TABLE public.savings_accounts ALTER COLUMN opening_sequence ADD GENERATED BY DEFAULT AS IDENTITY (
+    SEQUENCE NAME public.savings_accounts_opening_sequence_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+);
 
 
 --
@@ -1338,7 +1598,7 @@ CREATE TABLE public.savings_deposits (
     savings_account_id uuid NOT NULL,
     customer_id uuid NOT NULL,
     deposit_reference character varying(100) NOT NULL,
-    amount numeric(20,2) NOT NULL,
+    amount bigint NOT NULL,
     currency character(3) DEFAULT 'NGN'::bpchar NOT NULL,
     channel public.savings_transaction_channel_enum NOT NULL,
     status public.savings_transaction_status_enum DEFAULT 'PENDING'::public.savings_transaction_status_enum NOT NULL,
@@ -1354,7 +1614,14 @@ CREATE TABLE public.savings_deposits (
     correlation_id uuid NOT NULL,
     request_id text,
     failure_code text,
-    CONSTRAINT chk_savings_deposit_amount CHECK ((amount > (0)::numeric)),
+    request_hash character(64),
+    ledger_journal_id uuid,
+    ledger_request_hash character(64),
+    ledger_posted_at timestamp with time zone,
+    CONSTRAINT chk_savings_deposit_amount CHECK ((amount > 0)),
+    CONSTRAINT savings_deposit_ledger_hash CHECK (((ledger_request_hash IS NULL) OR (ledger_request_hash ~ '^[a-f0-9]{64}$'::text))),
+    CONSTRAINT savings_deposit_request_hash CHECK ((request_hash ~ '^[a-f0-9]{64}$'::text)),
+    CONSTRAINT savings_deposit_success_evidence CHECK (((status <> 'SUCCESSFUL'::public.savings_transaction_status_enum) OR ((ledger_transaction_id IS NOT NULL) AND (ledger_journal_id IS NOT NULL) AND (ledger_request_hash IS NOT NULL) AND (ledger_posted_at IS NOT NULL) AND (processed_at IS NOT NULL)))),
     CONSTRAINT savings_deposits_check CHECK ((((status)::text <> 'SUCCESSFUL'::text) OR (ledger_transaction_id IS NOT NULL)))
 );
 
@@ -1370,7 +1637,7 @@ CREATE TABLE public.savings_goal_contributions (
     tenant_id uuid NOT NULL,
     goal_id uuid NOT NULL,
     customer_id uuid NOT NULL,
-    amount numeric(20,2) NOT NULL,
+    amount bigint NOT NULL,
     currency character(3) DEFAULT 'NGN'::bpchar NOT NULL,
     status public.savings_transaction_status_enum DEFAULT 'PENDING'::public.savings_transaction_status_enum NOT NULL,
     channel public.savings_transaction_channel_enum NOT NULL,
@@ -1380,7 +1647,7 @@ CREATE TABLE public.savings_goal_contributions (
     processed_at timestamp with time zone,
     deposit_id uuid NOT NULL,
     contribution_reference text NOT NULL,
-    CONSTRAINT chk_goal_contribution_amount CHECK ((amount > (0)::numeric))
+    CONSTRAINT chk_goal_contribution_amount CHECK ((amount > 0))
 );
 
 ALTER TABLE ONLY public.savings_goal_contributions FORCE ROW LEVEL SECURITY;
@@ -1416,7 +1683,7 @@ CREATE TABLE public.savings_goal_withdrawals (
     tenant_id uuid NOT NULL,
     goal_id uuid NOT NULL,
     customer_id uuid NOT NULL,
-    amount numeric(20,2) NOT NULL,
+    amount bigint NOT NULL,
     currency character(3) DEFAULT 'NGN'::bpchar NOT NULL,
     status public.savings_transaction_status_enum DEFAULT 'PENDING'::public.savings_transaction_status_enum NOT NULL,
     payment_transaction_id uuid,
@@ -1426,7 +1693,19 @@ CREATE TABLE public.savings_goal_withdrawals (
     processed_at timestamp with time zone,
     withdrawal_id uuid NOT NULL,
     withdrawal_reference text NOT NULL,
-    CONSTRAINT chk_goal_withdrawal_amount CHECK ((amount > (0)::numeric))
+    withdrawal_kind text DEFAULT 'PARTIAL'::text NOT NULL,
+    forfeited_interest_minor bigint DEFAULT 0 NOT NULL,
+    idempotency_key character varying(255),
+    request_hash character(64),
+    ledger_journal_id uuid,
+    ledger_request_hash character(64),
+    ledger_posted_at timestamp with time zone,
+    CONSTRAINT chk_goal_withdrawal_amount CHECK ((amount > 0)),
+    CONSTRAINT savings_goal_withdrawal_forfeiture CHECK ((forfeited_interest_minor >= 0)),
+    CONSTRAINT savings_goal_withdrawal_hash CHECK (((request_hash IS NULL) OR (request_hash ~ '^[a-f0-9]{64}$'::text))),
+    CONSTRAINT savings_goal_withdrawal_kind CHECK ((withdrawal_kind = ANY (ARRAY['PARTIAL'::text, 'BREAK'::text]))),
+    CONSTRAINT savings_goal_withdrawal_ledger_hash CHECK (((ledger_request_hash IS NULL) OR (ledger_request_hash ~ '^[a-f0-9]{64}$'::text))),
+    CONSTRAINT savings_goal_withdrawal_success CHECK (((status <> 'SUCCESSFUL'::public.savings_transaction_status_enum) OR ((ledger_transaction_id IS NOT NULL) AND (ledger_journal_id IS NOT NULL) AND (ledger_request_hash IS NOT NULL) AND (ledger_posted_at IS NOT NULL) AND (processed_at IS NOT NULL))))
 );
 
 ALTER TABLE ONLY public.savings_goal_withdrawals FORCE ROW LEVEL SECURITY;
@@ -1444,8 +1723,8 @@ CREATE TABLE public.savings_goals (
     goal_reference character varying(100) NOT NULL,
     goal_name character varying(150) NOT NULL,
     description text,
-    target_amount numeric(20,2) NOT NULL,
-    current_amount numeric(20,2) DEFAULT 0 NOT NULL,
+    target_amount bigint NOT NULL,
+    current_amount bigint DEFAULT 0 NOT NULL,
     currency character(3) DEFAULT 'NGN'::bpchar NOT NULL,
     target_date date,
     status public.savings_goal_status_enum DEFAULT 'ACTIVE'::public.savings_goal_status_enum NOT NULL,
@@ -1454,8 +1733,25 @@ CREATE TABLE public.savings_goals (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     deleted_at timestamp with time zone,
-    CONSTRAINT chk_savings_goal_current CHECK ((current_amount >= (0)::numeric)),
-    CONSTRAINT chk_savings_goal_target CHECK ((target_amount > (0)::numeric)),
+    creation_idempotency_key character varying(255),
+    creation_request_hash character(64),
+    product_terms_hash character(64),
+    partial_withdrawal_limit_rate numeric(18,10) DEFAULT 50 NOT NULL,
+    partial_withdrawal_limit_count integer DEFAULT 1 NOT NULL,
+    partial_withdrawal_count integer DEFAULT 0 NOT NULL,
+    withdrawn_interest_forfeiture boolean DEFAULT true NOT NULL,
+    break_forfeits_all_interest boolean DEFAULT true NOT NULL,
+    accrued_interest numeric(30,12) DEFAULT 0 NOT NULL,
+    broken_at timestamp with time zone,
+    completed_at timestamp with time zone,
+    lifecycle_evidence jsonb,
+    CONSTRAINT chk_savings_goal_current CHECK ((current_amount >= 0)),
+    CONSTRAINT chk_savings_goal_target CHECK ((target_amount > 0)),
+    CONSTRAINT savings_goal_creation_hash CHECK (((creation_request_hash IS NULL) OR (creation_request_hash ~ '^[a-f0-9]{64}$'::text))),
+    CONSTRAINT savings_goal_interest_nonnegative CHECK ((accrued_interest >= (0)::numeric)),
+    CONSTRAINT savings_goal_lifecycle_evidence CHECK ((((status <> 'CANCELLED'::public.savings_goal_status_enum) OR ((broken_at IS NOT NULL) AND (lifecycle_evidence IS NOT NULL))) AND ((status <> 'COMPLETED'::public.savings_goal_status_enum) OR (completed_at IS NOT NULL)))),
+    CONSTRAINT savings_goal_partial_policy CHECK (((partial_withdrawal_limit_rate = (50)::numeric) AND (partial_withdrawal_limit_count = 1) AND ((partial_withdrawal_count >= 0) AND (partial_withdrawal_count <= partial_withdrawal_limit_count)))),
+    CONSTRAINT savings_goal_terms_hash CHECK (((product_terms_hash IS NULL) OR (product_terms_hash ~ '^[a-f0-9]{64}$'::text))),
     CONSTRAINT savings_goals_deleted_at_check CHECK ((deleted_at IS NULL))
 );
 
@@ -1543,11 +1839,22 @@ CREATE TABLE public.savings_interest_accrual_batches (
     algorithm_version text NOT NULL,
     status text DEFAULT 'PENDING'::text NOT NULL,
     accounts_processed integer DEFAULT 0 NOT NULL,
-    total_interest numeric(24,8) DEFAULT 0 NOT NULL,
+    total_interest numeric(30,12) DEFAULT 0 NOT NULL,
     started_at timestamp with time zone,
     completed_at timestamp with time zone,
     last_error text,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
+    idempotency_key character varying(255),
+    request_hash character(64),
+    correlation_id uuid,
+    attempt_count integer DEFAULT 0 NOT NULL,
+    locked_at timestamp with time zone,
+    locked_by text,
+    lease_expires_at timestamp with time zone,
+    next_retry_at timestamp with time zone,
+    CONSTRAINT interest_accrual_batch_attempts CHECK ((attempt_count >= 0)),
+    CONSTRAINT interest_accrual_batch_hash CHECK (((request_hash IS NULL) OR (request_hash ~ '^[a-f0-9]{64}$'::text))),
+    CONSTRAINT interest_accrual_batch_lease CHECK ((((locked_at IS NULL) = (locked_by IS NULL)) AND ((locked_at IS NULL) = (lease_expires_at IS NULL)))),
     CONSTRAINT savings_interest_accrual_batches_accounts_processed_check CHECK ((accounts_processed >= 0)),
     CONSTRAINT savings_interest_accrual_batches_status_check CHECK ((status = ANY (ARRAY['PENDING'::text, 'PROCESSING'::text, 'COMPLETED'::text, 'FAILED'::text]))),
     CONSTRAINT savings_interest_accrual_batches_total_interest_check CHECK ((total_interest >= (0)::numeric))
@@ -1565,13 +1872,20 @@ CREATE TABLE public.savings_interest_accrual_corrections (
     tenant_id uuid NOT NULL,
     interest_accrual_id uuid NOT NULL,
     correction_reference text NOT NULL,
-    signed_amount numeric(24,8) NOT NULL,
+    signed_amount numeric(30,12) NOT NULL,
     reason text NOT NULL,
     created_by uuid NOT NULL,
     approved_by uuid NOT NULL,
     ledger_transaction_id uuid NOT NULL,
     correction_payment_id uuid,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
+    approval_id uuid,
+    approval_authority_level integer,
+    ledger_journal_id uuid,
+    ledger_request_hash character(64),
+    ledger_posted_at timestamp with time zone,
+    CONSTRAINT interest_correction_approval CHECK (((approval_id IS NOT NULL) AND (created_by <> approved_by))),
+    CONSTRAINT interest_correction_ledger CHECK (((ledger_request_hash IS NOT NULL) AND (ledger_request_hash ~ '^[a-f0-9]{64}$'::text) AND (ledger_journal_id IS NOT NULL) AND (ledger_posted_at IS NOT NULL))),
     CONSTRAINT savings_interest_accrual_corrections_check CHECK ((created_by <> approved_by)),
     CONSTRAINT savings_interest_accrual_corrections_signed_amount_check CHECK ((signed_amount <> (0)::numeric))
 );
@@ -1589,9 +1903,9 @@ CREATE TABLE public.savings_interest_accruals (
     savings_account_id uuid NOT NULL,
     customer_id uuid NOT NULL,
     accrual_date date NOT NULL,
-    opening_balance numeric(20,2) NOT NULL,
-    applicable_rate numeric(10,6) NOT NULL,
-    interest_amount numeric(24,8) NOT NULL,
+    opening_balance bigint NOT NULL,
+    applicable_rate numeric(18,10) NOT NULL,
+    interest_amount numeric(30,12) NOT NULL,
     currency character(3) DEFAULT 'NGN'::bpchar NOT NULL,
     posted boolean DEFAULT false NOT NULL,
     ledger_transaction_id uuid,
@@ -1601,15 +1915,19 @@ CREATE TABLE public.savings_interest_accruals (
     fixed_deposit_rate_id uuid,
     accrual_batch_id uuid NOT NULL,
     fixed_deposit_id uuid,
-    calculation_basis_amount numeric(20,2) NOT NULL,
+    calculation_basis_amount bigint NOT NULL,
     day_count_basis text NOT NULL,
     days_in_basis integer NOT NULL,
     calculation_method public.interest_calculation_method_enum NOT NULL,
     posted_at timestamp with time zone,
+    request_hash character(64),
+    calculation_snapshot jsonb,
     CONSTRAINT chk_interest_accrual_amount CHECK ((interest_amount >= (0)::numeric)),
-    CONSTRAINT chk_interest_accrual_balance CHECK ((opening_balance >= (0)::numeric)),
-    CONSTRAINT chk_interest_accrual_rate CHECK ((applicable_rate >= (0)::numeric)),
-    CONSTRAINT savings_interest_accruals_calculation_basis_amount_check CHECK ((calculation_basis_amount >= (0)::numeric)),
+    CONSTRAINT interest_accrual_basis_minor CHECK ((calculation_basis_amount >= 0)),
+    CONSTRAINT interest_accrual_opening_minor CHECK ((opening_balance >= 0)),
+    CONSTRAINT interest_accrual_rate CHECK ((applicable_rate >= (0)::numeric)),
+    CONSTRAINT interest_accrual_request_hash CHECK (((request_hash IS NOT NULL) AND (request_hash ~ '^[a-f0-9]{64}$'::text))),
+    CONSTRAINT interest_accrual_snapshot CHECK (((calculation_snapshot IS NOT NULL) AND (jsonb_typeof(calculation_snapshot) = 'object'::text))),
     CONSTRAINT savings_interest_accruals_check CHECK ((num_nonnulls(product_rate_id, fixed_deposit_rate_id) = 1)),
     CONSTRAINT savings_interest_accruals_check1 CHECK (((fixed_deposit_id IS NOT NULL) = (fixed_deposit_rate_id IS NOT NULL))),
     CONSTRAINT savings_interest_accruals_check2 CHECK ((posted = (ledger_transaction_id IS NOT NULL))),
@@ -1630,9 +1948,11 @@ CREATE TABLE public.savings_interest_payment_accruals (
     tenant_id uuid NOT NULL,
     interest_payment_id uuid NOT NULL,
     interest_accrual_id uuid NOT NULL,
-    allocated_amount numeric(24,8) NOT NULL,
+    allocated_unrounded numeric(30,12) NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT savings_interest_payment_accruals_allocated_amount_check CHECK ((allocated_amount >= (0)::numeric))
+    allocated_minor bigint DEFAULT 0 NOT NULL,
+    CONSTRAINT interest_allocation_minor CHECK ((allocated_minor >= 0)),
+    CONSTRAINT savings_interest_payment_accruals_allocated_amount_check CHECK ((allocated_unrounded >= (0)::numeric))
 );
 
 ALTER TABLE ONLY public.savings_interest_payment_accruals FORCE ROW LEVEL SECURITY;
@@ -1654,6 +1974,19 @@ CREATE TABLE public.savings_interest_payment_batches (
     completed_at timestamp with time zone,
     last_error text,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
+    idempotency_key character varying(255),
+    request_hash character(64),
+    correlation_id uuid,
+    attempt_count integer DEFAULT 0 NOT NULL,
+    locked_at timestamp with time zone,
+    locked_by text,
+    lease_expires_at timestamp with time zone,
+    next_retry_at timestamp with time zone,
+    payments_processed integer DEFAULT 0 NOT NULL,
+    total_paid_minor bigint DEFAULT 0 NOT NULL,
+    CONSTRAINT interest_payment_batch_counts CHECK (((attempt_count >= 0) AND (payments_processed >= 0) AND (total_paid_minor >= 0))),
+    CONSTRAINT interest_payment_batch_hash CHECK (((request_hash IS NULL) OR (request_hash ~ '^[a-f0-9]{64}$'::text))),
+    CONSTRAINT interest_payment_batch_lease CHECK ((((locked_at IS NULL) = (locked_by IS NULL)) AND ((locked_at IS NULL) = (lease_expires_at IS NULL)))),
     CONSTRAINT savings_interest_payment_batches_check CHECK ((period_end >= period_start)),
     CONSTRAINT savings_interest_payment_batches_status_check CHECK ((status = ANY (ARRAY['PENDING'::text, 'PROCESSING'::text, 'COMPLETED'::text, 'FAILED'::text])))
 );
@@ -1671,7 +2004,7 @@ CREATE TABLE public.savings_interest_payments (
     savings_account_id uuid NOT NULL,
     customer_id uuid NOT NULL,
     payment_reference character varying(100) NOT NULL,
-    amount numeric(20,2) NOT NULL,
+    amount bigint NOT NULL,
     currency character(3) DEFAULT 'NGN'::bpchar NOT NULL,
     payment_period_start date NOT NULL,
     payment_period_end date NOT NULL,
@@ -1679,25 +2012,34 @@ CREATE TABLE public.savings_interest_payments (
     ledger_transaction_id uuid,
     paid_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    tax_amount numeric(20,2) DEFAULT 0 NOT NULL,
+    tax_amount bigint DEFAULT 0 NOT NULL,
     settlement_basis text DEFAULT 'ACCRUED'::text NOT NULL,
     fixed_deposit_id uuid,
-    net_amount numeric(20,2) GENERATED ALWAYS AS ((amount - tax_amount)) STORED,
     payment_batch_id uuid NOT NULL,
-    rounding_adjustment numeric(24,8) DEFAULT 0 NOT NULL,
+    rounding_adjustment bigint DEFAULT 0 NOT NULL,
     operation_id uuid NOT NULL,
     idempotency_key text NOT NULL,
     correlation_id uuid NOT NULL,
     request_id text,
     failure_code text,
-    CONSTRAINT chk_interest_payment_amount CHECK ((amount >= (0)::numeric)),
+    net_amount bigint GENERATED ALWAYS AS ((amount - tax_amount)) STORED,
+    request_hash character(64),
+    calculation_snapshot jsonb,
+    ledger_journal_id uuid,
+    ledger_request_hash character(64),
+    ledger_posted_at timestamp with time zone,
+    interest_expense_account_id uuid,
+    CONSTRAINT chk_interest_payment_amount CHECK (((amount)::numeric >= (0)::numeric)),
     CONSTRAINT chk_interest_payment_period CHECK ((payment_period_end >= payment_period_start)),
+    CONSTRAINT interest_payment_hash CHECK (((request_hash IS NOT NULL) AND (request_hash ~ '^[a-f0-9]{64}$'::text))),
+    CONSTRAINT interest_payment_ledger_hash CHECK (((ledger_request_hash IS NULL) OR (ledger_request_hash ~ '^[a-f0-9]{64}$'::text))),
+    CONSTRAINT interest_payment_snapshot CHECK (((calculation_snapshot IS NOT NULL) AND (jsonb_typeof(calculation_snapshot) = 'object'::text))),
+    CONSTRAINT interest_payment_success_evidence CHECK (((status <> 'SUCCESSFUL'::public.savings_transaction_status_enum) OR ((ledger_transaction_id IS NOT NULL) AND (ledger_journal_id IS NOT NULL) AND (ledger_request_hash IS NOT NULL) AND (ledger_posted_at IS NOT NULL) AND (interest_expense_account_id IS NOT NULL) AND (paid_at IS NOT NULL)))),
     CONSTRAINT savings_interest_payments_check CHECK (((settlement_basis <> 'PREPAID'::text) OR (fixed_deposit_id IS NOT NULL))),
     CONSTRAINT savings_interest_payments_check1 CHECK ((tax_amount <= amount)),
     CONSTRAINT savings_interest_payments_check2 CHECK ((((status)::text <> 'SUCCESSFUL'::text) OR (ledger_transaction_id IS NOT NULL))),
-    CONSTRAINT savings_interest_payments_rounding_adjustment_check CHECK ((abs(rounding_adjustment) <= 0.01)),
     CONSTRAINT savings_interest_payments_settlement_basis_check CHECK ((settlement_basis = ANY (ARRAY['ACCRUED'::text, 'PREPAID'::text]))),
-    CONSTRAINT savings_interest_payments_tax_amount_check CHECK ((tax_amount >= (0)::numeric))
+    CONSTRAINT savings_interest_payments_tax_amount_check CHECK (((tax_amount)::numeric >= (0)::numeric))
 );
 
 ALTER TABLE ONLY public.savings_interest_payments FORCE ROW LEVEL SECURITY;
@@ -1730,7 +2072,7 @@ CREATE TABLE public.savings_outbox_events (
     locked_at timestamp with time zone,
     locked_by text,
     dead_lettered_at timestamp with time zone,
-    CONSTRAINT chk_savings_outbox_status CHECK (((status)::text = ANY ((ARRAY['PENDING'::character varying, 'PROCESSING'::character varying, 'PUBLISHED'::character varying, 'FAILED'::character varying, 'DEAD_LETTER'::character varying])::text[]))),
+    CONSTRAINT chk_savings_outbox_status CHECK (((status)::text = ANY (ARRAY[('PENDING'::character varying)::text, ('PROCESSING'::character varying)::text, ('PUBLISHED'::character varying)::text, ('FAILED'::character varying)::text, ('DEAD_LETTER'::character varying)::text]))),
     CONSTRAINT savings_outbox_events_aggregate_version_check CHECK ((aggregate_version > 0)),
     CONSTRAINT savings_outbox_events_check CHECK ((((status)::text <> 'PUBLISHED'::text) OR (published_at IS NOT NULL))),
     CONSTRAINT savings_outbox_events_event_version_check CHECK ((event_version > 0)),
@@ -1779,8 +2121,8 @@ CREATE TABLE public.savings_product_fees (
     savings_product_id uuid NOT NULL,
     fee_code character varying(50) NOT NULL,
     fee_name character varying(150) NOT NULL,
-    percentage_rate numeric(10,6),
-    fixed_amount numeric(20,2),
+    percentage_rate numeric(18,10),
+    fixed_amount bigint,
     currency character(3) DEFAULT 'NGN'::bpchar NOT NULL,
     is_active boolean DEFAULT true NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
@@ -1788,8 +2130,8 @@ CREATE TABLE public.savings_product_fees (
     product_version_id uuid NOT NULL,
     fee_event text NOT NULL,
     calculation_basis text DEFAULT 'TRANSACTION_AMOUNT'::text NOT NULL,
-    minimum_fee numeric(20,2) DEFAULT 0 NOT NULL,
-    maximum_fee numeric(20,2),
+    minimum_fee bigint DEFAULT 0 NOT NULL,
+    maximum_fee bigint,
     tax_inclusive boolean DEFAULT false NOT NULL,
     ledger_fee_code text NOT NULL,
     effective_from timestamp with time zone NOT NULL,
@@ -1799,8 +2141,8 @@ CREATE TABLE public.savings_product_fees (
     CONSTRAINT savings_product_fees_check CHECK (((maximum_fee IS NULL) OR (maximum_fee >= minimum_fee))),
     CONSTRAINT savings_product_fees_check1 CHECK (((effective_to IS NULL) OR (effective_to > effective_from))),
     CONSTRAINT savings_product_fees_fee_event_check CHECK ((fee_event = ANY (ARRAY['WITHDRAWAL'::text, 'EARLY_LIQUIDATION'::text, 'TRANSFER'::text, 'CLOSURE'::text, 'MAINTENANCE'::text]))),
-    CONSTRAINT savings_product_fees_fixed_amount_check CHECK (((fixed_amount IS NULL) OR (fixed_amount >= (0)::numeric))),
-    CONSTRAINT savings_product_fees_minimum_fee_check CHECK ((minimum_fee >= (0)::numeric)),
+    CONSTRAINT savings_product_fees_fixed_amount_check CHECK (((fixed_amount IS NULL) OR ((fixed_amount)::numeric >= (0)::numeric))),
+    CONSTRAINT savings_product_fees_minimum_fee_check CHECK (((minimum_fee)::numeric >= (0)::numeric)),
     CONSTRAINT savings_product_fees_percentage_rate_check CHECK (((percentage_rate IS NULL) OR ((percentage_rate >= (0)::numeric) AND (percentage_rate <= (100)::numeric))))
 );
 
@@ -1817,15 +2159,15 @@ CREATE TABLE public.savings_product_rates (
     savings_product_id uuid NOT NULL,
     effective_from timestamp with time zone NOT NULL,
     effective_to timestamp with time zone,
-    interest_rate numeric(10,6) NOT NULL,
-    minimum_balance numeric(20,2),
-    maximum_balance numeric(20,2),
+    interest_rate numeric(18,10) NOT NULL,
+    minimum_balance bigint,
+    maximum_balance bigint,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     product_version_id uuid NOT NULL,
     CONSTRAINT chk_savings_rate CHECK ((interest_rate >= (0)::numeric)),
     CONSTRAINT chk_savings_rate_dates CHECK (((effective_to IS NULL) OR (effective_to > effective_from))),
-    CONSTRAINT savings_product_rates_check CHECK (((maximum_balance IS NULL) OR (maximum_balance > COALESCE(minimum_balance, (0)::numeric)))),
-    CONSTRAINT savings_product_rates_minimum_balance_check CHECK (((minimum_balance IS NULL) OR (minimum_balance >= (0)::numeric)))
+    CONSTRAINT savings_product_rates_check CHECK (((maximum_balance IS NULL) OR ((maximum_balance)::numeric > COALESCE((minimum_balance)::numeric, (0)::numeric)))),
+    CONSTRAINT savings_product_rates_minimum_balance_check CHECK (((minimum_balance IS NULL) OR ((minimum_balance)::numeric >= (0)::numeric)))
 );
 
 ALTER TABLE ONLY public.savings_product_rates FORCE ROW LEVEL SECURITY;
@@ -1864,9 +2206,9 @@ CREATE TABLE public.savings_product_tiers (
     tenant_id uuid NOT NULL,
     savings_product_id uuid NOT NULL,
     tier_code character varying(50) NOT NULL,
-    minimum_balance numeric(20,2),
-    maximum_balance numeric(20,2),
-    interest_rate numeric(10,6),
+    minimum_balance bigint,
+    maximum_balance bigint,
+    interest_rate numeric(18,10),
     configuration jsonb DEFAULT '{}'::jsonb NOT NULL,
     is_active boolean DEFAULT true NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
@@ -1875,10 +2217,10 @@ CREATE TABLE public.savings_product_tiers (
     effective_from timestamp with time zone NOT NULL,
     effective_to timestamp with time zone,
     CONSTRAINT chk_savings_tier_balance CHECK (((minimum_balance IS NULL) OR (maximum_balance IS NULL) OR (maximum_balance >= minimum_balance))),
-    CONSTRAINT savings_product_tiers_check CHECK (((maximum_balance IS NULL) OR (maximum_balance > COALESCE(minimum_balance, (0)::numeric)))),
+    CONSTRAINT savings_product_tiers_check CHECK (((maximum_balance IS NULL) OR ((maximum_balance)::numeric > COALESCE((minimum_balance)::numeric, (0)::numeric)))),
     CONSTRAINT savings_product_tiers_check1 CHECK (((effective_to IS NULL) OR (effective_to > effective_from))),
     CONSTRAINT savings_product_tiers_interest_rate_check CHECK (((interest_rate IS NULL) OR (interest_rate >= (0)::numeric))),
-    CONSTRAINT savings_product_tiers_minimum_balance_check CHECK (((minimum_balance IS NULL) OR (minimum_balance >= (0)::numeric)))
+    CONSTRAINT savings_product_tiers_minimum_balance_check CHECK (((minimum_balance IS NULL) OR ((minimum_balance)::numeric >= (0)::numeric)))
 );
 
 ALTER TABLE ONLY public.savings_product_tiers FORCE ROW LEVEL SECURITY;
@@ -1898,9 +2240,9 @@ CREATE TABLE public.savings_product_versions (
     effective_to timestamp with time zone,
     currency character(3) NOT NULL,
     product_type public.savings_product_type_enum NOT NULL,
-    minimum_balance numeric(20,2) DEFAULT 0 NOT NULL,
-    minimum_deposit numeric(20,2) DEFAULT 0 NOT NULL,
-    maximum_balance numeric(20,2),
+    minimum_balance bigint,
+    minimum_deposit bigint DEFAULT 0 NOT NULL,
+    maximum_balance bigint,
     calculation_method public.interest_calculation_method_enum NOT NULL,
     payment_frequency public.interest_payment_frequency_enum NOT NULL,
     rate_basis text DEFAULT 'ANNUAL_PERCENT'::text NOT NULL,
@@ -1916,6 +2258,20 @@ CREATE TABLE public.savings_product_versions (
     published_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    annual_rate numeric(18,10) DEFAULT 0 NOT NULL,
+    is_current boolean DEFAULT false NOT NULL,
+    idempotency_key character varying(255),
+    request_hash character(64),
+    approval_id uuid,
+    approval_payload_hash character(64),
+    approval_maker_id uuid,
+    approval_checker_ids uuid[],
+    approved_authority_level integer,
+    published_by uuid,
+    publication_idempotency_key character varying(255),
+    publication_request_hash character(64),
+    CONSTRAINT savings_maker_checker CHECK (((approval_checker_ids IS NULL) OR (NOT (approval_maker_id = ANY (approval_checker_ids))))),
+    CONSTRAINT savings_ordinary_no_minimum CHECK (((product_type <> 'ORDINARY'::public.savings_product_type_enum) OR (minimum_balance IS NULL))),
     CONSTRAINT savings_product_versions_check CHECK (((effective_to IS NULL) OR (effective_to > effective_from))),
     CONSTRAINT savings_product_versions_check1 CHECK (((maximum_balance IS NULL) OR (maximum_balance >= minimum_balance))),
     CONSTRAINT savings_product_versions_check2 CHECK (((approved_by IS NULL) OR (approved_by <> created_by))),
@@ -1924,12 +2280,15 @@ CREATE TABLE public.savings_product_versions (
     CONSTRAINT savings_product_versions_currency_check CHECK ((currency ~ '^[A-Z]{3}$'::text)),
     CONSTRAINT savings_product_versions_day_count_basis_check CHECK ((day_count_basis = ANY (ARRAY['ACT_365_FIXED'::text, 'ACT_ACT'::text, 'ACT_360'::text, '30_360'::text]))),
     CONSTRAINT savings_product_versions_lock_period_days_check CHECK ((lock_period_days >= 0)),
-    CONSTRAINT savings_product_versions_minimum_balance_check CHECK ((minimum_balance >= (0)::numeric)),
-    CONSTRAINT savings_product_versions_minimum_deposit_check CHECK ((minimum_deposit >= (0)::numeric)),
+    CONSTRAINT savings_product_versions_minimum_balance_check CHECK (((minimum_balance)::numeric >= (0)::numeric)),
+    CONSTRAINT savings_product_versions_minimum_deposit_check CHECK (((minimum_deposit)::numeric >= (0)::numeric)),
+    CONSTRAINT savings_product_versions_publication_request_hash_check CHECK (((publication_request_hash IS NULL) OR (publication_request_hash ~ '^[a-f0-9]{64}$'::text))),
     CONSTRAINT savings_product_versions_rate_basis_check CHECK ((rate_basis = 'ANNUAL_PERCENT'::text)),
-    CONSTRAINT savings_product_versions_status_check CHECK ((status = ANY (ARRAY['DRAFT'::text, 'PUBLISHED'::text]))),
+    CONSTRAINT savings_product_versions_request_hash_check CHECK (((request_hash IS NULL) OR (request_hash ~ '^[a-f0-9]{64}$'::text))),
     CONSTRAINT savings_product_versions_terms_check CHECK ((jsonb_typeof(terms) = 'object'::text)),
-    CONSTRAINT savings_product_versions_version_number_check CHECK ((version_number > 0))
+    CONSTRAINT savings_product_versions_version_number_check CHECK ((version_number > 0)),
+    CONSTRAINT savings_publication_evidence CHECK (((status <> ALL (ARRAY['PUBLISHED'::text, 'RETIRED'::text])) OR ((approval_id IS NOT NULL) AND (approval_payload_hash IS NOT NULL) AND (approval_maker_id IS NOT NULL) AND (cardinality(approval_checker_ids) > 0) AND (approved_authority_level > 0) AND (published_by IS NOT NULL) AND (published_at IS NOT NULL)))),
+    CONSTRAINT savings_version_status CHECK ((status = ANY (ARRAY['DRAFT'::text, 'PENDING_APPROVAL'::text, 'PUBLISHED'::text, 'RETIRED'::text])))
 );
 
 ALTER TABLE ONLY public.savings_product_versions FORCE ROW LEVEL SECURITY;
@@ -1947,10 +2306,10 @@ CREATE TABLE public.savings_products (
     product_type public.savings_product_type_enum NOT NULL,
     description text,
     currency character(3) DEFAULT 'NGN'::bpchar NOT NULL,
-    minimum_balance numeric(20,2) DEFAULT 0 NOT NULL,
-    minimum_deposit numeric(20,2) DEFAULT 0 NOT NULL,
-    maximum_balance numeric(20,2),
-    interest_rate numeric(10,6) DEFAULT 0 NOT NULL,
+    minimum_balance bigint DEFAULT 0 NOT NULL,
+    minimum_deposit bigint DEFAULT 0 NOT NULL,
+    maximum_balance bigint,
+    interest_rate numeric(18,10) DEFAULT 0 NOT NULL,
     interest_calculation_method public.interest_calculation_method_enum DEFAULT 'DAILY_BALANCE'::public.interest_calculation_method_enum NOT NULL,
     interest_payment_frequency public.interest_payment_frequency_enum DEFAULT 'MONTHLY'::public.interest_payment_frequency_enum NOT NULL,
     withdrawal_allowed boolean DEFAULT true NOT NULL,
@@ -1963,11 +2322,16 @@ CREATE TABLE public.savings_products (
     created_by uuid,
     updated_by uuid,
     deleted_at timestamp with time zone,
+    lifecycle_status text DEFAULT 'DRAFT'::text NOT NULL,
+    idempotency_key character varying(255),
+    request_hash character(64),
     CONSTRAINT chk_savings_product_interest CHECK ((interest_rate >= (0)::numeric)),
     CONSTRAINT chk_savings_product_max_balance CHECK (((maximum_balance IS NULL) OR (maximum_balance >= minimum_balance))),
-    CONSTRAINT chk_savings_product_min_balance CHECK ((minimum_balance >= (0)::numeric)),
-    CONSTRAINT chk_savings_product_min_deposit CHECK ((minimum_deposit >= (0)::numeric)),
-    CONSTRAINT savings_products_currency_check CHECK ((currency ~ '^[A-Z]{3}$'::text))
+    CONSTRAINT chk_savings_product_min_balance CHECK (((minimum_balance)::numeric >= (0)::numeric)),
+    CONSTRAINT chk_savings_product_min_deposit CHECK (((minimum_deposit)::numeric >= (0)::numeric)),
+    CONSTRAINT savings_products_currency_check CHECK ((currency ~ '^[A-Z]{3}$'::text)),
+    CONSTRAINT savings_products_lifecycle_status_check CHECK ((lifecycle_status = ANY (ARRAY['DRAFT'::text, 'ACTIVE'::text, 'RETIRED'::text]))),
+    CONSTRAINT savings_products_request_hash_check CHECK (((request_hash IS NULL) OR (request_hash ~ '^[a-f0-9]{64}$'::text)))
 );
 
 ALTER TABLE ONLY public.savings_products FORCE ROW LEVEL SECURITY;
@@ -2036,7 +2400,7 @@ CREATE TABLE public.savings_recurring_executions (
     recurring_plan_id uuid NOT NULL,
     execution_number integer NOT NULL,
     scheduled_date date NOT NULL,
-    amount numeric(20,2) NOT NULL,
+    amount bigint NOT NULL,
     status public.savings_transaction_status_enum DEFAULT 'PENDING'::public.savings_transaction_status_enum NOT NULL,
     payment_transaction_id uuid,
     ledger_transaction_id uuid,
@@ -2054,7 +2418,19 @@ CREATE TABLE public.savings_recurring_executions (
     idempotency_key text NOT NULL,
     correlation_id uuid NOT NULL,
     request_id text,
-    CONSTRAINT chk_recurring_execution_amount CHECK ((amount > (0)::numeric)),
+    request_hash character(64),
+    ledger_journal_id uuid,
+    ledger_request_hash character(64),
+    ledger_posted_at timestamp with time zone,
+    lease_expires_at timestamp with time zone,
+    retry_classification text,
+    terminal_at timestamp with time zone,
+    CONSTRAINT recurring_execution_amount_minor CHECK ((amount > 0)),
+    CONSTRAINT recurring_execution_hash CHECK (((request_hash IS NOT NULL) AND (request_hash ~ '^[a-f0-9]{64}$'::text))),
+    CONSTRAINT recurring_execution_lease CHECK ((((locked_at IS NULL) = (locked_by IS NULL)) AND ((locked_at IS NULL) = (lease_expires_at IS NULL)))),
+    CONSTRAINT recurring_execution_ledger_hash CHECK (((ledger_request_hash IS NULL) OR (ledger_request_hash ~ '^[a-f0-9]{64}$'::text))),
+    CONSTRAINT recurring_execution_retry_classification CHECK (((retry_classification IS NULL) OR (retry_classification = ANY (ARRAY['RETRYABLE'::text, 'TERMINAL'::text, 'INSUFFICIENT_FUNDS'::text])))),
+    CONSTRAINT recurring_execution_success_evidence CHECK (((status <> 'SUCCESSFUL'::public.savings_transaction_status_enum) OR ((deposit_id IS NOT NULL) AND (ledger_transaction_id IS NOT NULL) AND (ledger_journal_id IS NOT NULL) AND (ledger_request_hash IS NOT NULL) AND (ledger_posted_at IS NOT NULL) AND (completed_at IS NOT NULL)))),
     CONSTRAINT savings_recurring_executions_attempt_count_check CHECK ((attempt_count >= 0)),
     CONSTRAINT savings_recurring_executions_check CHECK ((((status)::text <> 'SUCCESSFUL'::text) OR (ledger_transaction_id IS NOT NULL))),
     CONSTRAINT savings_recurring_executions_execution_number_check CHECK ((execution_number > 0))
@@ -2074,7 +2450,7 @@ CREATE TABLE public.savings_recurring_plans (
     customer_id uuid NOT NULL,
     goal_id uuid,
     plan_reference character varying(100) NOT NULL,
-    amount numeric(20,2) NOT NULL,
+    amount bigint NOT NULL,
     currency character(3) DEFAULT 'NGN'::bpchar NOT NULL,
     frequency public.recurring_frequency_enum NOT NULL,
     start_date date NOT NULL,
@@ -2092,9 +2468,26 @@ CREATE TABLE public.savings_recurring_plans (
     execution_time time without time zone DEFAULT '08:00:00'::time without time zone NOT NULL,
     payment_mandate_id uuid,
     retry_limit integer DEFAULT 3 NOT NULL,
-    CONSTRAINT chk_recurring_amount CHECK ((amount > (0)::numeric)),
+    status text DEFAULT 'ACTIVE'::text NOT NULL,
+    funding_source text DEFAULT 'WALLET'::text NOT NULL,
+    creation_idempotency_key character varying(255),
+    creation_request_hash character(64),
+    correlation_id uuid,
+    consent_reference character varying(255),
+    schedule_snapshot jsonb DEFAULT '{}'::jsonb NOT NULL,
+    aggregate_version bigint DEFAULT 1 NOT NULL,
+    completed_at timestamp with time zone,
+    cancelled_at timestamp with time zone,
     CONSTRAINT chk_recurring_dates CHECK (((end_date IS NULL) OR (end_date >= start_date))),
     CONSTRAINT chk_recurring_execution_count CHECK ((execution_count >= 0)),
+    CONSTRAINT recurring_plan_aggregate_version CHECK ((aggregate_version > 0)),
+    CONSTRAINT recurring_plan_amount_minor CHECK ((amount > 0)),
+    CONSTRAINT recurring_plan_creation_evidence CHECK (((creation_idempotency_key IS NOT NULL) AND (creation_request_hash IS NOT NULL) AND (correlation_id IS NOT NULL) AND (consent_reference IS NOT NULL))),
+    CONSTRAINT recurring_plan_creation_hash CHECK (((creation_request_hash IS NULL) OR (creation_request_hash ~ '^[a-f0-9]{64}$'::text))),
+    CONSTRAINT recurring_plan_snapshot CHECK ((jsonb_typeof(schedule_snapshot) = 'object'::text)),
+    CONSTRAINT recurring_plan_status CHECK ((status = ANY (ARRAY['ACTIVE'::text, 'PAUSED'::text, 'COMPLETED'::text, 'CANCELLED'::text, 'EXHAUSTED'::text]))),
+    CONSTRAINT recurring_plan_terminal_time CHECK ((((status <> ALL (ARRAY['COMPLETED'::text, 'EXHAUSTED'::text])) OR (completed_at IS NOT NULL)) AND ((status <> 'CANCELLED'::text) OR (cancelled_at IS NOT NULL)))),
+    CONSTRAINT recurring_plan_wallet_only CHECK (((funding_source = 'WALLET'::text) AND (source_account_id IS NOT NULL))),
     CONSTRAINT savings_recurring_plans_check CHECK (((max_executions IS NULL) OR (execution_count <= max_executions))),
     CONSTRAINT savings_recurring_plans_check1 CHECK (((next_execution_date IS NULL) OR (next_execution_date >= start_date))),
     CONSTRAINT savings_recurring_plans_check2 CHECK (((end_date IS NULL) OR (next_execution_date IS NULL) OR (next_execution_date <= end_date))),
@@ -2149,8 +2542,8 @@ CREATE TABLE public.savings_withdrawals (
     savings_account_id uuid NOT NULL,
     customer_id uuid NOT NULL,
     withdrawal_reference character varying(100) NOT NULL,
-    amount numeric(20,2) NOT NULL,
-    fee_amount numeric(20,2) DEFAULT 0 NOT NULL,
+    amount bigint NOT NULL,
+    fee_amount bigint DEFAULT 0 NOT NULL,
     currency character(3) DEFAULT 'NGN'::bpchar NOT NULL,
     channel public.savings_transaction_channel_enum NOT NULL,
     status public.savings_transaction_status_enum DEFAULT 'PENDING'::public.savings_transaction_status_enum NOT NULL,
@@ -2167,8 +2560,15 @@ CREATE TABLE public.savings_withdrawals (
     correlation_id uuid NOT NULL,
     request_id text,
     failure_code text,
-    CONSTRAINT chk_savings_withdrawal_amount CHECK ((amount > (0)::numeric)),
-    CONSTRAINT chk_savings_withdrawal_fee CHECK ((fee_amount >= (0)::numeric)),
+    request_hash character(64),
+    ledger_journal_id uuid,
+    ledger_request_hash character(64),
+    ledger_posted_at timestamp with time zone,
+    CONSTRAINT chk_savings_withdrawal_amount CHECK ((amount > 0)),
+    CONSTRAINT chk_savings_withdrawal_fee CHECK ((fee_amount >= 0)),
+    CONSTRAINT savings_withdrawal_ledger_hash CHECK (((ledger_request_hash IS NULL) OR (ledger_request_hash ~ '^[a-f0-9]{64}$'::text))),
+    CONSTRAINT savings_withdrawal_request_hash CHECK (((request_hash IS NULL) OR (request_hash ~ '^[a-f0-9]{64}$'::text))),
+    CONSTRAINT savings_withdrawal_success_evidence CHECK (((status <> 'SUCCESSFUL'::public.savings_transaction_status_enum) OR ((ledger_transaction_id IS NOT NULL) AND (ledger_journal_id IS NOT NULL) AND (ledger_request_hash IS NOT NULL) AND (ledger_posted_at IS NOT NULL) AND (processed_at IS NOT NULL)))),
     CONSTRAINT savings_withdrawals_check CHECK ((((status)::text <> 'SUCCESSFUL'::text) OR (ledger_transaction_id IS NOT NULL)))
 );
 
@@ -2309,6 +2709,38 @@ ALTER TABLE ONLY public.fixed_deposit_maturities
 
 ALTER TABLE ONLY public.fixed_deposit_maturities
     ADD CONSTRAINT fixed_deposit_maturities_tenant_id_maturity_reference_key UNIQUE (tenant_id, maturity_reference);
+
+
+--
+-- Name: fixed_deposit_quotes fixed_deposit_quotes_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.fixed_deposit_quotes
+    ADD CONSTRAINT fixed_deposit_quotes_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: fixed_deposit_quotes fixed_deposit_quotes_tenant_id_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.fixed_deposit_quotes
+    ADD CONSTRAINT fixed_deposit_quotes_tenant_id_id_key UNIQUE (tenant_id, id);
+
+
+--
+-- Name: fixed_deposit_quotes fixed_deposit_quotes_tenant_id_idempotency_key_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.fixed_deposit_quotes
+    ADD CONSTRAINT fixed_deposit_quotes_tenant_id_idempotency_key_key UNIQUE (tenant_id, idempotency_key);
+
+
+--
+-- Name: fixed_deposit_quotes fixed_deposit_quotes_tenant_id_quote_hash_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.fixed_deposit_quotes
+    ADD CONSTRAINT fixed_deposit_quotes_tenant_id_quote_hash_key UNIQUE (tenant_id, quote_hash);
 
 
 --
@@ -2676,7 +3108,7 @@ ALTER TABLE ONLY public.savings_deposits
 --
 
 ALTER TABLE ONLY public.fixed_deposit_rates
-    ADD CONSTRAINT savings_fd_rate_nonoverlap EXCLUDE USING gist (tenant_id WITH =, product_version_id WITH =, tenure_days WITH =, numrange(minimum_amount, maximum_amount, '[)'::text) WITH &&, tstzrange(effective_from, effective_to, '[)'::text) WITH &&);
+    ADD CONSTRAINT savings_fd_rate_nonoverlap EXCLUDE USING gist (tenant_id WITH =, product_version_id WITH =, tenure_days WITH =, numrange((minimum_amount)::numeric, (maximum_amount)::numeric, '[)'::text) WITH &&, tstzrange(effective_from, effective_to, '[)'::text) WITH &&);
 
 
 --
@@ -3000,14 +3432,6 @@ ALTER TABLE ONLY public.savings_outbox_events
 
 
 --
--- Name: savings_outbox_events savings_outbox_events_tenant_id_aggregate_type_aggregate_id_key; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.savings_outbox_events
-    ADD CONSTRAINT savings_outbox_events_tenant_id_aggregate_type_aggregate_id_key UNIQUE (tenant_id, aggregate_type, aggregate_id, aggregate_version);
-
-
---
 -- Name: savings_outbox_events savings_outbox_events_tenant_id_id_key; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -3172,7 +3596,7 @@ ALTER TABLE ONLY public.savings_products
 --
 
 ALTER TABLE ONLY public.savings_product_rates
-    ADD CONSTRAINT savings_rate_nonoverlap EXCLUDE USING gist (tenant_id WITH =, product_version_id WITH =, numrange(COALESCE(minimum_balance, (0)::numeric), maximum_balance, '[)'::text) WITH &&, tstzrange(effective_from, effective_to, '[)'::text) WITH &&);
+    ADD CONSTRAINT savings_rate_nonoverlap EXCLUDE USING gist (tenant_id WITH =, product_version_id WITH =, numrange(COALESCE((minimum_balance)::numeric, (0)::numeric), (maximum_balance)::numeric, '[)'::text) WITH &&, tstzrange(effective_from, effective_to, '[)'::text) WITH &&);
 
 
 --
@@ -3276,7 +3700,7 @@ ALTER TABLE ONLY public.savings_recurring_plans
 --
 
 ALTER TABLE ONLY public.savings_product_tiers
-    ADD CONSTRAINT savings_tier_nonoverlap EXCLUDE USING gist (tenant_id WITH =, product_version_id WITH =, numrange(COALESCE(minimum_balance, (0)::numeric), maximum_balance, '[)'::text) WITH &&, tstzrange(effective_from, effective_to, '[)'::text) WITH &&) WHERE (is_active);
+    ADD CONSTRAINT savings_tier_nonoverlap EXCLUDE USING gist (tenant_id WITH =, product_version_id WITH =, numrange(COALESCE((minimum_balance)::numeric, (0)::numeric), (maximum_balance)::numeric, '[)'::text) WITH &&, tstzrange(effective_from, effective_to, '[)'::text) WITH &&) WHERE (is_active);
 
 
 --
@@ -3356,7 +3780,7 @@ ALTER TABLE ONLY public.savings_interest_payments
 --
 
 ALTER TABLE ONLY public.savings_recurring_executions
-    ADD CONSTRAINT uq_recurring_execution UNIQUE (recurring_plan_id, execution_number);
+    ADD CONSTRAINT uq_recurring_execution UNIQUE (tenant_id, recurring_plan_id, execution_number);
 
 
 --
@@ -3428,7 +3852,7 @@ ALTER TABLE ONLY public.savings_idempotency_keys
 --
 
 ALTER TABLE ONLY public.savings_interest_accruals
-    ADD CONSTRAINT uq_savings_interest_accrual UNIQUE (savings_account_id, accrual_date);
+    ADD CONSTRAINT uq_savings_interest_accrual UNIQUE (tenant_id, savings_account_id, accrual_date);
 
 
 --
@@ -3487,10 +3911,24 @@ CREATE INDEX fixed_deposit_rates_version_idx ON public.fixed_deposit_rates USING
 
 
 --
+-- Name: idx_fixed_deposit_due_active; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_fixed_deposit_due_active ON public.fixed_deposits USING btree (tenant_id, maturity_date, id) WHERE (status = 'ACTIVE'::public.fixed_deposit_status_enum);
+
+
+--
 -- Name: idx_fixed_deposit_interest_payments; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX idx_fixed_deposit_interest_payments ON public.fixed_deposit_interest_payments USING btree (fixed_deposit_id, payment_date);
+
+
+--
+-- Name: idx_fixed_deposit_quote_expiry; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_fixed_deposit_quote_expiry ON public.fixed_deposit_quotes USING btree (tenant_id, expires_at) WHERE (consumed_at IS NULL);
 
 
 --
@@ -3613,6 +4051,13 @@ CREATE INDEX idx_interest_payments_status ON public.savings_interest_payments US
 
 
 --
+-- Name: idx_recurring_execution_retry; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_recurring_execution_retry ON public.savings_recurring_executions USING btree (tenant_id, next_retry_at, id) WHERE (status = ANY (ARRAY['PENDING'::public.savings_transaction_status_enum, 'FAILED'::public.savings_transaction_status_enum]));
+
+
+--
 -- Name: idx_recurring_executions_plan; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -3631,6 +4076,13 @@ CREATE INDEX idx_recurring_executions_scheduled ON public.savings_recurring_exec
 --
 
 CREATE INDEX idx_recurring_executions_status ON public.savings_recurring_executions USING btree (tenant_id, status);
+
+
+--
+-- Name: idx_recurring_plan_claim; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_recurring_plan_claim ON public.savings_recurring_plans USING btree (tenant_id, next_execution_date, id) WHERE ((status = 'ACTIVE'::text) AND is_active);
 
 
 --
@@ -3942,6 +4394,13 @@ CREATE INDEX idx_savings_transfers_status ON public.savings_transfer_requests US
 
 
 --
+-- Name: idx_savings_version_catalog; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_savings_version_catalog ON public.savings_product_versions USING btree (tenant_id, product_type, status, effective_from);
+
+
+--
 -- Name: idx_savings_withdrawals_account; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -4015,7 +4474,7 @@ CREATE UNIQUE INDEX savings_one_prepaid_interest ON public.savings_interest_paym
 -- Name: savings_outbox_retry; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX savings_outbox_retry ON public.savings_outbox_events USING btree (tenant_id, available_at) WHERE ((status)::text = ANY ((ARRAY['PENDING'::character varying, 'FAILED'::character varying])::text[]));
+CREATE INDEX savings_outbox_retry ON public.savings_outbox_events USING btree (tenant_id, available_at) WHERE ((status)::text = ANY (ARRAY[('PENDING'::character varying)::text, ('FAILED'::character varying)::text]));
 
 
 --
@@ -4068,6 +4527,139 @@ CREATE INDEX savings_restrictions_active ON public.savings_account_restrictions 
 
 
 --
+-- Name: uq_fixed_deposit_current_instruction; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_fixed_deposit_current_instruction ON public.fixed_deposit_instructions USING btree (tenant_id, fixed_deposit_id) WHERE (superseded_at IS NULL);
+
+
+--
+-- Name: uq_fixed_deposit_instruction_idempotency; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_fixed_deposit_instruction_idempotency ON public.fixed_deposit_instructions USING btree (tenant_id, idempotency_key) WHERE (idempotency_key IS NOT NULL);
+
+
+--
+-- Name: uq_fixed_deposit_open_liquidation; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_fixed_deposit_open_liquidation ON public.fixed_deposit_liquidations USING btree (tenant_id, fixed_deposit_id) WHERE (status <> ALL (ARRAY['FAILED'::text, 'REJECTED'::text, 'CANCELLED'::text]));
+
+
+--
+-- Name: uq_fixed_deposit_placement_idempotency; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_fixed_deposit_placement_idempotency ON public.fixed_deposits USING btree (tenant_id, placement_idempotency_key) WHERE (placement_idempotency_key IS NOT NULL);
+
+
+--
+-- Name: uq_interest_accrual_batch_idempotency; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_interest_accrual_batch_idempotency ON public.savings_interest_accrual_batches USING btree (tenant_id, idempotency_key) WHERE (idempotency_key IS NOT NULL);
+
+
+--
+-- Name: uq_interest_payment_batch_idempotency; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_interest_payment_batch_idempotency ON public.savings_interest_payment_batches USING btree (tenant_id, idempotency_key) WHERE (idempotency_key IS NOT NULL);
+
+
+--
+-- Name: uq_recurring_plan_creation_idempotency; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_recurring_plan_creation_idempotency ON public.savings_recurring_plans USING btree (tenant_id, creation_idempotency_key);
+
+
+--
+-- Name: uq_savings_account_opening_idempotency; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_savings_account_opening_idempotency ON public.savings_accounts USING btree (tenant_id, opening_idempotency_key) WHERE (opening_idempotency_key IS NOT NULL);
+
+
+--
+-- Name: uq_savings_account_opening_sequence; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_savings_account_opening_sequence ON public.savings_accounts USING btree (opening_sequence);
+
+
+--
+-- Name: uq_savings_current_version; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_savings_current_version ON public.savings_product_versions USING btree (tenant_id, savings_product_id) WHERE is_current;
+
+
+--
+-- Name: uq_savings_goal_creation_idempotency; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_savings_goal_creation_idempotency ON public.savings_goals USING btree (tenant_id, creation_idempotency_key) WHERE (creation_idempotency_key IS NOT NULL);
+
+
+--
+-- Name: uq_savings_goal_one_break; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_savings_goal_one_break ON public.savings_goal_withdrawals USING btree (tenant_id, goal_id) WHERE ((withdrawal_kind = 'BREAK'::text) AND (status <> ALL (ARRAY['FAILED'::public.savings_transaction_status_enum, 'CANCELLED'::public.savings_transaction_status_enum, 'REVERSED'::public.savings_transaction_status_enum])));
+
+
+--
+-- Name: uq_savings_goal_one_partial; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_savings_goal_one_partial ON public.savings_goal_withdrawals USING btree (tenant_id, goal_id) WHERE ((withdrawal_kind = 'PARTIAL'::text) AND (status <> ALL (ARRAY['FAILED'::public.savings_transaction_status_enum, 'CANCELLED'::public.savings_transaction_status_enum, 'REVERSED'::public.savings_transaction_status_enum])));
+
+
+--
+-- Name: uq_savings_goal_withdrawal_idempotency; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_savings_goal_withdrawal_idempotency ON public.savings_goal_withdrawals USING btree (tenant_id, idempotency_key) WHERE (idempotency_key IS NOT NULL);
+
+
+--
+-- Name: uq_savings_one_customer_product_account; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_savings_one_customer_product_account ON public.savings_accounts USING btree (tenant_id, customer_id, savings_product_id, currency) WHERE ((deleted_at IS NULL) AND (product_type = ANY (ARRAY['ORDINARY'::public.savings_product_type_enum, 'TARGET'::public.savings_product_type_enum])));
+
+
+--
+-- Name: uq_savings_outbox_aggregate_fact; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_savings_outbox_aggregate_fact ON public.savings_outbox_events USING btree (tenant_id, aggregate_type, aggregate_id, event_type, aggregate_version);
+
+
+--
+-- Name: uq_savings_product_idempotency; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_savings_product_idempotency ON public.savings_products USING btree (tenant_id, idempotency_key) WHERE (idempotency_key IS NOT NULL);
+
+
+--
+-- Name: uq_savings_publication_idempotency; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_savings_publication_idempotency ON public.savings_product_versions USING btree (tenant_id, publication_idempotency_key) WHERE (publication_idempotency_key IS NOT NULL);
+
+
+--
+-- Name: uq_savings_version_idempotency; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_savings_version_idempotency ON public.savings_product_versions USING btree (tenant_id, idempotency_key) WHERE (idempotency_key IS NOT NULL);
+
+
+--
 -- Name: savings_accounts account_setup; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -4114,13 +4706,6 @@ CREATE TRIGGER fd_interest_context BEFORE INSERT OR UPDATE ON public.fixed_depos
 --
 
 CREATE CONSTRAINT TRIGGER holder_setup AFTER INSERT OR DELETE OR UPDATE ON public.savings_account_holders DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.savings_require_account_setup();
-
-
---
--- Name: fixed_deposit_instructions immutable_row; Type: TRIGGER; Schema: public; Owner: -
---
-
-CREATE TRIGGER immutable_row BEFORE DELETE OR UPDATE ON public.fixed_deposit_instructions FOR EACH ROW EXECUTE FUNCTION public.savings_reject_mutation();
 
 
 --
@@ -4239,21 +4824,21 @@ CREATE TRIGGER protect_final BEFORE DELETE OR UPDATE ON public.savings_adjustmen
 -- Name: savings_deposits protect_final; Type: TRIGGER; Schema: public; Owner: -
 --
 
-CREATE TRIGGER protect_final BEFORE DELETE OR UPDATE ON public.savings_deposits FOR EACH ROW EXECUTE FUNCTION public.savings_protect_success();
+CREATE TRIGGER protect_final BEFORE DELETE OR UPDATE ON public.savings_deposits FOR EACH ROW EXECUTE FUNCTION public.savings_protect_deposit();
 
 
 --
 -- Name: savings_goal_contributions protect_final; Type: TRIGGER; Schema: public; Owner: -
 --
 
-CREATE TRIGGER protect_final BEFORE DELETE OR UPDATE ON public.savings_goal_contributions FOR EACH ROW EXECUTE FUNCTION public.savings_protect_success();
+CREATE TRIGGER protect_final BEFORE DELETE OR UPDATE ON public.savings_goal_contributions FOR EACH ROW EXECUTE FUNCTION public.savings_protect_goal_final();
 
 
 --
 -- Name: savings_goal_withdrawals protect_final; Type: TRIGGER; Schema: public; Owner: -
 --
 
-CREATE TRIGGER protect_final BEFORE DELETE OR UPDATE ON public.savings_goal_withdrawals FOR EACH ROW EXECUTE FUNCTION public.savings_protect_success();
+CREATE TRIGGER protect_final BEFORE DELETE OR UPDATE ON public.savings_goal_withdrawals FOR EACH ROW EXECUTE FUNCTION public.savings_protect_goal_final();
 
 
 --
@@ -4281,7 +4866,28 @@ CREATE TRIGGER protect_final BEFORE DELETE OR UPDATE ON public.savings_transfer_
 -- Name: savings_withdrawals protect_final; Type: TRIGGER; Schema: public; Owner: -
 --
 
-CREATE TRIGGER protect_final BEFORE DELETE OR UPDATE ON public.savings_withdrawals FOR EACH ROW EXECUTE FUNCTION public.savings_protect_success();
+CREATE TRIGGER protect_final BEFORE DELETE OR UPDATE ON public.savings_withdrawals FOR EACH ROW EXECUTE FUNCTION public.savings_protect_withdrawal();
+
+
+--
+-- Name: fixed_deposits protect_fixed_deposit; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER protect_fixed_deposit BEFORE DELETE OR UPDATE ON public.fixed_deposits FOR EACH ROW EXECUTE FUNCTION public.savings_protect_fixed_deposit();
+
+
+--
+-- Name: savings_goals protect_goal; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER protect_goal BEFORE DELETE OR UPDATE ON public.savings_goals FOR EACH ROW EXECUTE FUNCTION public.savings_protect_goal();
+
+
+--
+-- Name: fixed_deposit_instructions protect_instruction; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER protect_instruction BEFORE DELETE OR UPDATE ON public.fixed_deposit_instructions FOR EACH ROW EXECUTE FUNCTION public.savings_protect_fd_instruction();
 
 
 --
@@ -4467,6 +5073,20 @@ CREATE TRIGGER validate_journal BEFORE INSERT ON public.savings_account_transact
 
 
 --
+-- Name: savings_recurring_executions validate_recurring_execution; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER validate_recurring_execution BEFORE INSERT OR UPDATE ON public.savings_recurring_executions FOR EACH ROW EXECUTE FUNCTION public.savings_validate_recurring_execution();
+
+
+--
+-- Name: savings_recurring_plans validate_recurring_plan; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER validate_recurring_plan BEFORE INSERT OR DELETE OR UPDATE ON public.savings_recurring_plans FOR EACH ROW EXECUTE FUNCTION public.savings_validate_recurring_plan();
+
+
+--
 -- Name: fixed_deposit_instructions fixed_deposit_instructions_tenant_id_fixed_deposit_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -4512,6 +5132,22 @@ ALTER TABLE ONLY public.fixed_deposit_maturities
 
 ALTER TABLE ONLY public.fixed_deposit_maturities
     ADD CONSTRAINT fixed_deposit_maturities_tenant_id_instruction_id_fkey FOREIGN KEY (tenant_id, instruction_id) REFERENCES public.fixed_deposit_instructions(tenant_id, id);
+
+
+--
+-- Name: fixed_deposit_quotes fixed_deposit_quotes_tenant_id_fixed_deposit_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.fixed_deposit_quotes
+    ADD CONSTRAINT fixed_deposit_quotes_tenant_id_fixed_deposit_id_fkey FOREIGN KEY (tenant_id, fixed_deposit_id) REFERENCES public.fixed_deposits(tenant_id, id);
+
+
+--
+-- Name: fixed_deposit_quotes fixed_deposit_quotes_tenant_id_product_version_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.fixed_deposit_quotes
+    ADD CONSTRAINT fixed_deposit_quotes_tenant_id_product_version_id_fkey FOREIGN KEY (tenant_id, product_version_id) REFERENCES public.savings_product_versions(tenant_id, id);
 
 
 --
@@ -5284,6 +5920,19 @@ ALTER TABLE public.fixed_deposit_maturities ENABLE ROW LEVEL SECURITY;
 --
 
 CREATE POLICY fixed_deposit_maturities_tenant_policy ON public.fixed_deposit_maturities USING ((tenant_id = (NULLIF(current_setting('app.current_tenant_id'::text, true), ''::text))::uuid)) WITH CHECK ((tenant_id = (NULLIF(current_setting('app.current_tenant_id'::text, true), ''::text))::uuid));
+
+
+--
+-- Name: fixed_deposit_quotes; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.fixed_deposit_quotes ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: fixed_deposit_quotes fixed_deposit_quotes_tenant_policy; Type: POLICY; Schema: public; Owner: -
+--
+
+CREATE POLICY fixed_deposit_quotes_tenant_policy ON public.fixed_deposit_quotes USING ((tenant_id = (NULLIF(current_setting('app.current_tenant_id'::text, true), ''::text))::uuid)) WITH CHECK ((tenant_id = (NULLIF(current_setting('app.current_tenant_id'::text, true), ''::text))::uuid));
 
 
 --
