@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import type { Knex } from "knex";
 
 const canonicalSnapshotHash =
-  "b2fa4579e2e87c81ed4b70182729fdf49ad41f85fc7e1070c370057f7c31edac";
+  "737d023988d19ecaa1bf8f1ad2e6bb3aa2df522aa1aade74df2971cc4f4aa55f";
 export const config = { transaction: false };
 
 export async function up(knex: Knex): Promise<void> {

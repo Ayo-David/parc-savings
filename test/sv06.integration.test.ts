@@ -137,9 +137,12 @@ describeDatabase("SV-06 interest accrual and payment", () => {
       idempotencyKey: randomUUID(),
     });
     accountId = account.id;
-    await database("savings_accounts")
-      .where({ id: accountId })
-      .update({ current_balance: "10001", total_deposited: "10001" });
+    await database("savings_accounts").where({ id: accountId }).update({
+      current_balance: "10001",
+      total_deposited: "10001",
+      // Accruals are only allowed on or after the opening date.
+      opened_at: "2026-09-01T00:00:00.000Z",
+    });
 
     const fixedProduct = await products.createProduct({
       tenantId,
@@ -207,6 +210,9 @@ describeDatabase("SV-06 interest accrual and payment", () => {
       .first<{ savings_account_id: string }>();
     if (!fixedDeposit) throw new Error("Fixed-deposit fixture was not stored");
     fixedAccountId = fixedDeposit.savings_account_id;
+    await database("savings_accounts")
+      .where({ id: fixedAccountId })
+      .update({ opened_at: "2026-09-13T00:00:00.000Z" });
   });
   afterAll(async () => database.destroy());
 

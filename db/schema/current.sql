@@ -621,7 +621,7 @@ CREATE FUNCTION public.savings_validate_allocation() RETURNS trigger
       SELECT * INTO a FROM savings_interest_accruals WHERE tenant_id=NEW.tenant_id AND id=NEW.interest_accrual_id FOR UPDATE;
       IF p.id IS NULL OR a.id IS NULL OR p.settlement_basis<>'ACCRUED' OR p.status IN ('SUCCESSFUL','REVERSED','CANCELLED') OR a.posted
         OR a.savings_account_id<>p.savings_account_id OR a.currency<>p.currency OR a.accrual_date<p.payment_period_start OR a.accrual_date>p.payment_period_end
-        OR NEW.allocated_unrounded<>a.interest_amount OR NEW.allocated_minor<>round(a.interest_amount)::bigint
+        OR NEW.allocated_unrounded<>a.interest_amount OR NEW.allocated_minor<>(CASE WHEN a.interest_amount-floor(a.interest_amount)=0.5 THEN floor(a.interest_amount)+mod(floor(a.interest_amount),2) ELSE round(a.interest_amount) END)::bigint
       THEN RAISE EXCEPTION 'Interest allocation does not match eligible accrual'; END IF;
       RETURN NEW;
     END $$;
@@ -665,7 +665,8 @@ CREATE FUNCTION public.savings_validate_fixed_deposit() RETURNS trigger
         SELECT * INTO v FROM savings_product_versions WHERE tenant_id=NEW.tenant_id AND id=NEW.product_version_id;
         SELECT * INTO r FROM fixed_deposit_rates WHERE tenant_id=NEW.tenant_id AND id=NEW.fixed_deposit_rate_id;
         IF a.id IS NULL OR v.id IS NULL OR r.id IS NULL OR a.product_version_id<>NEW.product_version_id OR v.product_type<>'FIXED_DEPOSIT'
-           OR r.product_version_id<>NEW.product_version_id OR r.tenure_days<>NEW.tenure_days OR r.interest_rate<>NEW.interest_rate
+           OR r.product_version_id<>NEW.product_version_id OR r.interest_rate<>NEW.interest_rate
+           OR NEW.tenure_days<(v.terms->>'minimumTenureDays')::integer OR NEW.tenure_days>(v.terms->>'maximumTenureDays')::integer
            OR NEW.principal_amount<r.minimum_amount OR (r.maximum_amount IS NOT NULL AND NEW.principal_amount>r.maximum_amount)
            OR NEW.accepted_at<r.effective_from OR (r.effective_to IS NOT NULL AND NEW.accepted_at>=r.effective_to)
         THEN RAISE EXCEPTION 'FD contract does not match account/product/rate/tenure/amount/effective period'; END IF;
@@ -810,14 +811,16 @@ CREATE FUNCTION public.savings_validate_recurring_plan() RETURNS trigger
     DECLARE a savings_accounts%ROWTYPE; g savings_goals%ROWTYPE;
     BEGIN
       IF TG_OP='DELETE' THEN RAISE EXCEPTION 'Recurring plans cannot be deleted'; END IF;
-      SELECT * INTO a FROM savings_accounts WHERE tenant_id=NEW.tenant_id AND id=NEW.savings_account_id;
-      IF NOT FOUND OR a.customer_id<>NEW.customer_id OR a.currency<>NEW.currency OR a.status<>'ACTIVE' OR a.product_type NOT IN ('ORDINARY','TARGET')
-      THEN RAISE EXCEPTION 'Recurring plan requires an active customer-owned savings account'; END IF;
-      IF (a.product_type='TARGET')<>(NEW.goal_id IS NOT NULL) THEN RAISE EXCEPTION 'Target recurring plan requires goal'; END IF;
-      IF NEW.goal_id IS NOT NULL THEN
-        SELECT * INTO g FROM savings_goals WHERE tenant_id=NEW.tenant_id AND id=NEW.goal_id;
-        IF NOT FOUND OR g.savings_account_id<>NEW.savings_account_id OR g.customer_id<>NEW.customer_id OR g.status<>'ACTIVE'
-        THEN RAISE EXCEPTION 'Recurring goal must be active and match account/customer'; END IF;
+      IF TG_OP='INSERT' OR (NEW.status='ACTIVE' AND OLD.status<>'ACTIVE') THEN
+        SELECT * INTO a FROM savings_accounts WHERE tenant_id=NEW.tenant_id AND id=NEW.savings_account_id;
+        IF NOT FOUND OR a.customer_id<>NEW.customer_id OR a.currency<>NEW.currency OR a.status<>'ACTIVE' OR a.product_type NOT IN ('ORDINARY','TARGET')
+        THEN RAISE EXCEPTION 'Recurring plan requires an active customer-owned savings account'; END IF;
+        IF (a.product_type='TARGET')<>(NEW.goal_id IS NOT NULL) THEN RAISE EXCEPTION 'Target recurring plan requires goal'; END IF;
+        IF NEW.goal_id IS NOT NULL THEN
+          SELECT * INTO g FROM savings_goals WHERE tenant_id=NEW.tenant_id AND id=NEW.goal_id;
+          IF NOT FOUND OR g.savings_account_id<>NEW.savings_account_id OR g.customer_id<>NEW.customer_id OR g.status<>'ACTIVE'
+          THEN RAISE EXCEPTION 'Recurring goal must be active and match account/customer'; END IF;
+        END IF;
       END IF;
       IF TG_OP='UPDATE' THEN
         IF (NEW.tenant_id,NEW.id,NEW.savings_account_id,NEW.customer_id,NEW.goal_id,NEW.amount,NEW.currency,NEW.frequency,NEW.start_date,NEW.end_date,NEW.max_executions,NEW.source_account_id,NEW.funding_source,NEW.timezone_name,NEW.execution_time,NEW.retry_limit,NEW.creation_idempotency_key,NEW.creation_request_hash,NEW.consent_reference,NEW.schedule_snapshot)

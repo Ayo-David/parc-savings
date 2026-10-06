@@ -177,8 +177,8 @@ try {
         versionId: version.id,
         approvalId:
           tenant.suffix === "A"
-            ? `11111111-1111-4111-8111-11111111115${productDefinitions.indexOf(definition) + 4}`
-            : `22222222-2222-4222-8222-22222222225${productDefinitions.indexOf(definition) + 4}`,
+            ? `11111111-1111-4111-8111-11111111${String(1154 + productDefinitions.indexOf(definition)).padStart(4, "0")}`
+            : `22222222-2222-4222-8222-22222222${String(2254 + productDefinitions.indexOf(definition)).padStart(4, "0")}`,
         publisherId: tenant.checkerId,
         idempotencyKey: `pr01-${key}-publication-v1`,
         correlationId: tenant.correlationId,

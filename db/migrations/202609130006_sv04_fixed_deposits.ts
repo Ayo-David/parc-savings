@@ -164,7 +164,8 @@ export async function up(knex: Knex): Promise<void> {
         SELECT * INTO v FROM savings_product_versions WHERE tenant_id=NEW.tenant_id AND id=NEW.product_version_id;
         SELECT * INTO r FROM fixed_deposit_rates WHERE tenant_id=NEW.tenant_id AND id=NEW.fixed_deposit_rate_id;
         IF a.id IS NULL OR v.id IS NULL OR r.id IS NULL OR a.product_version_id<>NEW.product_version_id OR v.product_type<>'FIXED_DEPOSIT'
-           OR r.product_version_id<>NEW.product_version_id OR r.tenure_days<>NEW.tenure_days OR r.interest_rate<>NEW.interest_rate
+           OR r.product_version_id<>NEW.product_version_id OR r.interest_rate<>NEW.interest_rate
+           OR NEW.tenure_days<(v.terms->>'minimumTenureDays')::integer OR NEW.tenure_days>(v.terms->>'maximumTenureDays')::integer
            OR NEW.principal_amount<r.minimum_amount OR (r.maximum_amount IS NOT NULL AND NEW.principal_amount>r.maximum_amount)
            OR NEW.accepted_at<r.effective_from OR (r.effective_to IS NOT NULL AND NEW.accepted_at>=r.effective_to)
         THEN RAISE EXCEPTION 'FD contract does not match account/product/rate/tenure/amount/effective period'; END IF;

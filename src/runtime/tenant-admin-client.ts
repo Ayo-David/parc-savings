@@ -36,11 +36,11 @@ export class TenantAdminClient implements SavingsApprovalGateway {
         signal: AbortSignal.timeout(this.timeoutMs),
       },
     );
-    const body = (await response.json()) as Record<string, unknown>;
     if (!response.ok)
       throw new Error(
         `Tenant Admin approval request failed (${response.status})`,
       );
+    const body = (await response.json()) as Record<string, unknown>;
     if (
       typeof body.id !== "string" ||
       typeof body.maker_id !== "string" ||

@@ -134,25 +134,24 @@ export class RecurringContributionService {
       this.database,
       input.tenantId,
       async (trx) => {
+        // Lock the plan first so concurrent workers serialize on it.
+        const plan = await trx("savings_recurring_plans")
+          .where({ tenant_id: input.tenantId, id: input.planId })
+          .forUpdate()
+          .first<Record<string, unknown>>();
         const existing = await trx("savings_recurring_executions")
           .where({
             tenant_id: input.tenantId,
             recurring_plan_id: input.planId,
             scheduled_date: input.scheduledDate,
           })
-          .first<Record<string, unknown>>();
-        if (existing?.status === "SUCCESSFUL")
-          return { execution: existing, plan: null };
-        const plan = await trx("savings_recurring_plans")
-          .where({
-            tenant_id: input.tenantId,
-            id: input.planId,
-            status: "ACTIVE",
-            is_active: true,
-          })
           .forUpdate()
           .first<Record<string, unknown>>();
-        if (!plan) throw new Error("Active recurring plan not found");
+        // A completed occurrence replays even if it exhausted the plan.
+        if (existing?.status === "SUCCESSFUL")
+          return { execution: existing, plan: null };
+        if (!plan || plan.status !== "ACTIVE" || plan.is_active !== true)
+          throw new Error("Active recurring plan not found");
         if (dateOnly(plan.next_execution_date) !== input.scheduledDate)
           throw new Error(
             "Scheduled date does not match the plan's next execution",
@@ -240,7 +239,7 @@ export class RecurringContributionService {
             .first<Record<string, unknown>>();
           if (!deposit)
             throw new Error("Recurring contribution evidence not found");
-          await trx("savings_recurring_executions")
+          const changed = await trx("savings_recurring_executions")
             .where({
               tenant_id: input.tenantId,
               id: prepared.execution.id,
@@ -259,6 +258,14 @@ export class RecurringContributionService {
               locked_by: null,
               lease_expires_at: null,
             });
+          if (changed !== 1) {
+            const current = await trx("savings_recurring_executions")
+              .where({ tenant_id: input.tenantId, id: prepared.execution.id })
+              .first<Record<string, unknown>>();
+            if (current?.status === "SUCCESSFUL")
+              return this.executionResult(current, true);
+            throw new Error("Recurring execution is no longer claimed");
+          }
           const next = nextDate(
             input.scheduledDate,
             String(plan.frequency) as Frequency,
@@ -268,7 +275,7 @@ export class RecurringContributionService {
             (plan.max_executions !== null &&
               count >= Number(plan.max_executions)) ||
             (plan.end_date !== null && next > dateOnly(plan.end_date));
-          await trx("savings_recurring_plans")
+          const [updated] = await trx("savings_recurring_plans")
             .where({ tenant_id: input.tenantId, id: input.planId })
             .update({
               execution_count: count,
@@ -276,7 +283,11 @@ export class RecurringContributionService {
               status: exhausted ? "EXHAUSTED" : "ACTIVE",
               is_active: !exhausted,
               completed_at: exhausted ? this.clock() : null,
-            });
+            })
+            .returning<Array<{ aggregate_version: string }>>(
+              "aggregate_version",
+            );
+          if (!updated) throw new Error("Recurring plan not found");
           await this.event(
             trx,
             input,
@@ -292,7 +303,7 @@ export class RecurringContributionService {
               currency: "NGN",
               scheduled_date: input.scheduledDate,
             },
-            count + 1,
+            Number(updated.aggregate_version),
           );
           const saved = await trx("savings_recurring_executions")
             .where({ tenant_id: input.tenantId, id: prepared.execution.id })
@@ -313,8 +324,13 @@ export class RecurringContributionService {
             error instanceof Error
               ? error.message
               : "Recurring contribution failed";
-          await trx("savings_recurring_executions")
-            .where({ tenant_id: input.tenantId, id: prepared.execution.id })
+          const changed = await trx("savings_recurring_executions")
+            .where({
+              tenant_id: input.tenantId,
+              id: prepared.execution.id,
+              status: "PROCESSING",
+              locked_by: input.workerId,
+            })
             .update({
               status: "FAILED",
               failure_reason: message,
@@ -328,6 +344,14 @@ export class RecurringContributionService {
               locked_by: null,
               lease_expires_at: null,
             });
+          if (changed !== 1) {
+            // Another worker owns this occurrence now; leave it to them.
+            const current = await trx("savings_recurring_executions")
+              .where({ tenant_id: input.tenantId, id: prepared.execution.id })
+              .first<Record<string, unknown>>();
+            if (!current) throw new Error("Recurring execution not found");
+            return this.executionResult(current, false);
+          }
           if (exhausted) {
             const next = nextDate(
               input.scheduledDate,
@@ -351,7 +375,7 @@ export class RecurringContributionService {
           await this.event(
             trx,
             input,
-            input.planId,
+            String(prepared.execution.id),
             "savings.recurring-contribution-failed.v1",
             {
               recurring_plan_id: input.planId,
@@ -363,7 +387,9 @@ export class RecurringContributionService {
               retryable: !exhausted,
               failure_code: "LEDGER_CONTRIBUTION_FAILED",
             },
-            Number(plan.aggregate_version) + attempts,
+            // Each attempt is a distinct fact of this execution.
+            attempts,
+            "recurring_execution",
           );
           const saved = await trx("savings_recurring_executions")
             .where({ tenant_id: input.tenantId, id: prepared.execution.id })
@@ -417,17 +443,18 @@ export class RecurringContributionService {
     eventType: string,
     payload: object,
     version = 1,
+    aggregateType: "recurring_plan" | "recurring_execution" = "recurring_plan",
   ) {
     await trx("savings_outbox_events").insert({
       tenant_id: input.tenantId,
-      aggregate_type: "recurring_plan",
+      aggregate_type: aggregateType,
       aggregate_id: aggregateId,
       aggregate_version: version,
       event_type: eventType,
       event_version: 1,
       correlation_id: input.correlationId,
       request_id: input.idempotencyKey,
-      partition_key: `${input.tenantId}:recurring_plan:${aggregateId}`,
+      partition_key: `${input.tenantId}:${aggregateType}:${aggregateId}`,
       payload,
     });
   }

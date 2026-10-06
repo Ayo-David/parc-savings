@@ -190,11 +190,6 @@ jobs:
             echo "Pulling immutable deployment unit: $IMAGE_URI"
             docker pull "$IMAGE_URI"
 
-            # Preserve the last known-good image as the rollback target.
-            if [ -f "$STATE_DIR/current_image.txt" ]; then
-              cp "$STATE_DIR/current_image.txt" "$STATE_DIR/previous_image.txt"
-            fi
-
             # --- STEP 1: RUN DATABASE MIGRATIONS (forward-only; never reverted on rollback) ---
             # MIGRATION_DATABASE_URL lets migrations use a DDL-owning login while the
             # application keeps its least-privilege DATABASE_URL; it falls back to DATABASE_URL.
@@ -217,6 +212,10 @@ jobs:
             # --- STEP 3: HEALTH-CHECK THE NEW CONTAINERS, AUTO-ROLLBACK ON FAILURE ---
             echo "Waiting for the new containers to report ready..."
             if wait_until_ready; then
+              # Only a healthy deploy promotes the last known-good image to the rollback target.
+              if [ -f "$STATE_DIR/current_image.txt" ]; then
+                cp "$STATE_DIR/current_image.txt" "$STATE_DIR/previous_image.txt"
+              fi
               echo "$IMAGE_URI" > "$STATE_DIR/current_image.txt"
               echo "Deploy succeeded: $IMAGE_URI"
               docker image prune -af --filter "until=72h"
@@ -224,8 +223,9 @@ jobs:
               echo "New containers failed readiness checks; rolling back." >&2
               docker logs --tail 50 "$CONTAINER_NAME" >&2 || true
               stop_service
-              if [ -f "$STATE_DIR/previous_image.txt" ]; then
-                start_service "$(cat "$STATE_DIR/previous_image.txt")"
+              # current_image.txt is untouched on failure, so it still names the last known-good image.
+              if [ -f "$STATE_DIR/current_image.txt" ]; then
+                start_service "$(cat "$STATE_DIR/current_image.txt")"
               fi
               exit 1
             fi

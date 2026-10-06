@@ -218,10 +218,9 @@ export class LedgerClient implements SavingsLedgerGateway {
       ...(input.body ? { body: JSON.stringify(input.body) } : {}),
       signal: AbortSignal.timeout(this.timeoutMs),
     });
-    const body = (await response.json()) as Record<string, unknown>;
     if (!response.ok)
       throw new Error(`Ledger request failed (${response.status})`);
-    return body;
+    return (await response.json()) as Record<string, unknown>;
   }
 }
 

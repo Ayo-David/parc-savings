@@ -74,6 +74,16 @@ export class FixedDepositService {
           BigInt(input.principalMinor) > BigInt(version.maximum_balance))
       )
         throw new Error("Fixed-deposit amount is outside product terms");
+      const rate = await this.effectiveRate(trx, {
+        tenantId: input.tenantId,
+        productVersionId: input.productVersionId,
+        tenureDays: input.tenureDays,
+        amountMinor: input.principalMinor,
+      });
+      if (!rate)
+        throw new Error(
+          "No effective fixed-deposit rate matches the tenure and amount",
+        );
       const unrounded = new Decimal(input.principalMinor)
         .mul(version.annual_rate)
         .mul(input.tenureDays)
@@ -291,82 +301,195 @@ export class FixedDepositService {
       quoteId: input.quoteId,
       quoteHash: input.quoteHash,
     });
-    const prior = await withTenantTransaction(
+    const reserved = await withTenantTransaction(
       this.database,
       input.tenantId,
-      (trx) =>
-        trx("fixed_deposits")
-          .where({
-            tenant_id: input.tenantId,
-            placement_idempotency_key: input.idempotencyKey,
-          })
-          .first<Record<string, unknown>>(),
+      (trx) => this.placementByKey(trx, input.tenantId, input.idempotencyKey),
     );
-    if (prior) return this.created(prior, requestHash, true);
-    const quote = await withTenantTransaction(
-      this.database,
-      input.tenantId,
-      (trx) =>
-        trx("fixed_deposit_quotes")
-          .where({
-            tenant_id: input.tenantId,
-            id: input.quoteId,
-            customer_id: input.customerId,
-            quote_type: "PLACEMENT",
-            product_version_id: input.productVersionId,
-            principal_minor: input.amountMinor,
-            currency: input.currency,
-            tenure_days: input.tenureDays,
-            quote_hash: input.quoteHash,
-          })
-          .whereNull("consumed_at")
-          .where("expires_at", ">", this.clock())
-          .first<Record<string, unknown>>(),
-    );
-    if (!quote)
-      throw new Error("Valid unconsumed fixed-deposit quote not found");
+    if (reserved && reserved.status !== "PENDING")
+      return this.created(reserved, requestHash, true);
+    const placement =
+      reserved ?? (await this.reservePlacement(input, requestHash));
+    if (placement.status !== "PENDING")
+      return this.created(placement, requestHash, true);
+    if (placement.placement_request_hash !== requestHash)
+      throw new Error("Fixed-deposit placement idempotency conflict");
+    const fixedLedgerAccountId = scalarString(placement.ledger_account_id);
+    const walletAccountId = scalarString(placement.source_account_id);
+    const postingHash = hash({
+      wallet: walletAccountId,
+      fixed: fixedLedgerAccountId,
+      amountMinor: input.amountMinor,
+      currency: input.currency,
+    });
+    // The quote is already consumed and the deposit is PENDING, so a failure
+    // here or below is resumed by retrying with the same idempotency key.
+    const posting = await this.ledger.postContribution({
+      tenantId: input.tenantId,
+      walletAccountId,
+      savingsAccountId: fixedLedgerAccountId,
+      amountMinor: input.amountMinor,
+      currency: input.currency,
+      reference: `FD-${input.idempotencyKey}`,
+      idempotencyKey: `fd:${input.idempotencyKey}:posting`,
+    });
+    return withTenantTransaction(this.database, input.tenantId, async (trx) => {
+      const id = scalarString(placement.id);
+      const maturityDate = dateOnly(placement.maturity_date);
+      const changed = await trx("fixed_deposits")
+        .where({ tenant_id: input.tenantId, id, status: "PENDING" })
+        .update({
+          status: "ACTIVE",
+          ledger_transaction_id: posting.transactionId,
+          ledger_journal_id: posting.journalId,
+          ledger_request_hash: postingHash,
+          ledger_posted_at: trx.fn.now(),
+        });
+      if (changed !== 1) {
+        const replay = await this.placementByKey(
+          trx,
+          input.tenantId,
+          input.idempotencyKey,
+        );
+        if (!replay) throw new Error("Fixed-deposit placement not found");
+        return this.created(replay, requestHash, true);
+      }
+      await trx("savings_accounts")
+        .where({
+          tenant_id: input.tenantId,
+          id: scalarString(placement.savings_account_id),
+        })
+        .update({
+          current_balance: input.amountMinor,
+          total_deposited: input.amountMinor,
+          ledger_synced_at: trx.fn.now(),
+        });
+      await this.event(trx, input, id, "savings.fixed-deposit-created.v1", {
+        fixed_deposit_id: id,
+        customer_id: input.customerId,
+        product_version_id: input.productVersionId,
+        principal_minor: input.amountMinor,
+        currency: input.currency,
+        maturity_date: maturityDate,
+      });
+      return {
+        fixedDepositId: id,
+        principalMinor: input.amountMinor,
+        interestRate: String(placement.interest_rate),
+        maturityDate,
+        currency: input.currency,
+        status: "ACTIVE" as const,
+        ledgerTransactionId: posting.transactionId,
+        replayed: false,
+      };
+    });
+  }
+
+  private placementByKey(
+    trx: Knex.Transaction,
+    tenantId: string,
+    idempotencyKey: string,
+  ) {
+    return trx("fixed_deposits as f")
+      .join("savings_accounts as a", function () {
+        this.on("a.tenant_id", "=", "f.tenant_id").andOn(
+          "a.id",
+          "=",
+          "f.savings_account_id",
+        );
+      })
+      .where({
+        "f.tenant_id": tenantId,
+        "f.placement_idempotency_key": idempotencyKey,
+      })
+      .first<Record<string, unknown> | undefined>("f.*", {
+        ledger_account_id: "a.ledger_account_id",
+      });
+  }
+
+  /** Rate band of a version that covers the tenure and amount right now. */
+  private effectiveRate(
+    trx: Knex.Transaction,
+    input: {
+      tenantId: string;
+      productVersionId: string;
+      tenureDays: number;
+      amountMinor: string;
+    },
+  ) {
+    return trx("fixed_deposit_rates")
+      .where({
+        tenant_id: input.tenantId,
+        product_version_id: input.productVersionId,
+      })
+      .where("tenure_days", "<=", input.tenureDays)
+      .where("minimum_amount", "<=", input.amountMinor)
+      .where((builder) => {
+        builder
+          .whereNull("maximum_amount")
+          .orWhere("maximum_amount", ">=", input.amountMinor);
+      })
+      .where("effective_from", "<=", trx.fn.now())
+      .where((builder) => {
+        builder
+          .whereNull("effective_to")
+          .orWhere("effective_to", ">", trx.fn.now());
+      })
+      .orderBy("tenure_days", "desc")
+      .first<{ id: string; interest_rate: string } | undefined>(
+        "id",
+        "interest_rate",
+      );
+  }
+
+  /**
+   * Validates the placement, atomically consumes the quote and records a
+   * PENDING deposit before any funds move.
+   */
+  private async reservePlacement(
+    input: Parameters<FixedDepositService["create"]>[0],
+    requestHash: string,
+  ): Promise<Record<string, unknown>> {
     const version = await withTenantTransaction(
       this.database,
       input.tenantId,
-      (trx) =>
-        trx("savings_product_versions as v")
-          .join("fixed_deposit_rates as r", function () {
-            this.on("r.tenant_id", "=", "v.tenant_id").andOn(
-              "r.product_version_id",
-              "=",
-              "v.id",
-            );
-          })
+      async (trx) => {
+        const row = await trx("savings_product_versions")
           .where({
-            "v.tenant_id": input.tenantId,
-            "v.id": input.productVersionId,
-            "v.product_type": "FIXED_DEPOSIT",
-            "v.status": "PUBLISHED",
-            "v.is_current": true,
-            "v.currency": input.currency,
+            tenant_id: input.tenantId,
+            id: input.productVersionId,
+            product_type: "FIXED_DEPOSIT",
+            status: "PUBLISHED",
+            is_current: true,
+            currency: input.currency,
           })
-          .where("v.effective_from", "<=", trx.fn.now())
-          .first<{
-            savings_product_id: string;
-            annual_rate: string;
-            minimum_deposit: string;
-            maximum_balance: string | null;
-            terms: Terms;
-            terms_hash: string;
-            rate_id: string;
-            day_count_basis: string;
-            compounding_method: string;
-          }>({
-            savings_product_id: "v.savings_product_id",
-            annual_rate: "v.annual_rate",
-            minimum_deposit: "v.minimum_deposit",
-            maximum_balance: "v.maximum_balance",
-            terms: "v.terms",
-            terms_hash: "v.terms_hash",
-            rate_id: "r.id",
-            day_count_basis: "v.day_count_basis",
-            compounding_method: "v.compounding_method",
-          }),
+          .where("effective_from", "<=", trx.fn.now())
+          .first<
+            | {
+                savings_product_id: string;
+                annual_rate: string;
+                minimum_deposit: string;
+                maximum_balance: string | null;
+                terms: Terms;
+                terms_hash: string;
+                day_count_basis: string;
+                compounding_method: string;
+              }
+            | undefined
+          >(
+            "savings_product_id",
+            "annual_rate",
+            "minimum_deposit",
+            "maximum_balance",
+            "terms",
+            "terms_hash",
+            "day_count_basis",
+            "compounding_method",
+          );
+        if (!row) return undefined;
+        const rate = await this.effectiveRate(trx, input);
+        return { ...row, rate };
+      },
     );
     if (!version)
       throw new Error(
@@ -383,6 +506,11 @@ export class FixedDepositService {
         BigInt(input.amountMinor) > BigInt(version.maximum_balance))
     )
       throw new Error("Fixed-deposit amount is outside product terms");
+    if (!version.rate)
+      throw new Error(
+        "No effective fixed-deposit rate matches the tenure and amount",
+      );
+    const rate = version.rate;
     const fixedLedger = await this.ledger.provisionAccount({
       tenantId: input.tenantId,
       customerId: input.customerId,
@@ -397,29 +525,32 @@ export class FixedDepositService {
       currency: input.currency,
       idempotencyKey: `fd:${input.idempotencyKey}:wallet`,
     });
-    const postingHash = hash({
-      wallet: wallet.accountId,
-      fixed: fixedLedger.accountId,
-      amountMinor: input.amountMinor,
-      currency: input.currency,
-    });
-    const posting = await this.ledger.postContribution({
-      tenantId: input.tenantId,
-      walletAccountId: wallet.accountId,
-      savingsAccountId: fixedLedger.accountId,
-      amountMinor: input.amountMinor,
-      currency: input.currency,
-      reference: `FD-${input.idempotencyKey}`,
-      idempotencyKey: `fd:${input.idempotencyKey}:posting`,
-    });
     return withTenantTransaction(this.database, input.tenantId, async (trx) => {
-      const replay = await trx("fixed_deposits")
+      const quote = await trx("fixed_deposit_quotes")
         .where({
           tenant_id: input.tenantId,
-          placement_idempotency_key: input.idempotencyKey,
+          id: input.quoteId,
+          customer_id: input.customerId,
+          quote_type: "PLACEMENT",
+          product_version_id: input.productVersionId,
+          principal_minor: input.amountMinor,
+          currency: input.currency,
+          tenure_days: input.tenureDays,
+          quote_hash: input.quoteHash,
         })
-        .first<Record<string, unknown>>();
-      if (replay) return this.created(replay, requestHash, true);
+        .whereNull("consumed_at")
+        .where("expires_at", ">", this.clock())
+        .update({ consumed_at: this.clock() })
+        .returning<Array<{ expires_at: Date }>>("expires_at");
+      if (quote.length !== 1) {
+        const replay = await this.placementByKey(
+          trx,
+          input.tenantId,
+          input.idempotencyKey,
+        );
+        if (replay) return replay;
+        throw new Error("Valid unconsumed fixed-deposit quote not found");
+      }
       const sequence = (
         await trx.raw<{ rows: Array<{ value: string }> }>(
           "SELECT nextval(pg_get_serial_sequence('savings_accounts','opening_sequence'))::text AS value",
@@ -483,7 +614,7 @@ export class FixedDepositService {
         request_id: input.idempotencyKey,
         correlation_id: input.correlationId,
       });
-      await trx("fixed_deposits").insert({
+      const row = {
         id,
         tenant_id: input.tenantId,
         savings_account_id: accountId,
@@ -491,21 +622,17 @@ export class FixedDepositService {
         deposit_reference: `SFD-${id}`,
         principal_amount: input.amountMinor,
         currency: input.currency,
-        interest_rate: version.annual_rate,
+        interest_rate: rate.interest_rate,
         tenure_days: input.tenureDays,
         start_date: startDate.toISOString().slice(0, 10),
         maturity_date: maturity.toISOString().slice(0, 10),
         interest_amount: "0",
         maturity_amount: input.amountMinor,
-        status: "ACTIVE",
+        status: "PENDING",
         source_account_id: wallet.accountId,
         destination_account_id: wallet.accountId,
-        ledger_transaction_id: posting.transactionId,
-        ledger_journal_id: posting.journalId,
-        ledger_request_hash: postingHash,
-        ledger_posted_at: trx.fn.now(),
         product_version_id: input.productVersionId,
-        fixed_deposit_rate_id: version.rate_id,
+        fixed_deposit_rate_id: rate.id,
         contract_reference: input.acceptanceReference,
         accepted_at: input.acceptedAt,
         accepted_terms_hash: version.terms_hash,
@@ -520,39 +647,12 @@ export class FixedDepositService {
           version.terms.earlyLiquidationPenaltyRate,
         quote_id: input.quoteId,
         quote_hash: input.quoteHash,
-        quote_expires_at: quote.expires_at,
+        quote_expires_at: quote[0]?.expires_at,
         created_by: input.customerId,
         previous_fixed_deposit_id: input.previousFixedDepositId ?? null,
-      });
-      await trx("savings_accounts")
-        .where({ tenant_id: input.tenantId, id: accountId })
-        .update({
-          current_balance: input.amountMinor,
-          total_deposited: input.amountMinor,
-          ledger_synced_at: trx.fn.now(),
-        });
-      await trx("fixed_deposit_quotes")
-        .where({ tenant_id: input.tenantId, id: input.quoteId })
-        .whereNull("consumed_at")
-        .update({ consumed_at: this.clock() });
-      await this.event(trx, input, id, "savings.fixed-deposit-created.v1", {
-        fixed_deposit_id: id,
-        customer_id: input.customerId,
-        product_version_id: input.productVersionId,
-        principal_minor: input.amountMinor,
-        currency: input.currency,
-        maturity_date: maturity.toISOString().slice(0, 10),
-      });
-      return {
-        fixedDepositId: id,
-        principalMinor: input.amountMinor,
-        interestRate: version.annual_rate,
-        maturityDate: maturity.toISOString().slice(0, 10),
-        currency: input.currency,
-        status: "ACTIVE" as const,
-        ledgerTransactionId: posting.transactionId,
-        replayed: false,
       };
+      await trx("fixed_deposits").insert(row);
+      return { ...row, ledger_account_id: fixedLedger.accountId };
     });
   }
 
@@ -666,25 +766,49 @@ export class FixedDepositService {
       };
     });
   }
-  public async mature(input: {
+  public async mature(request: {
     tenantId: string;
-    customerId: string;
+    /** Omitted by scheduled processing; the deposit's owner is used. */
+    customerId?: string;
     fixedDepositId: string;
     currency: "NGN";
     correlationId: string;
     idempotencyKey: string;
   }) {
+    const owner = await withTenantTransaction(
+      this.database,
+      request.tenantId,
+      (trx) =>
+        trx("fixed_deposits")
+          .where({
+            tenant_id: request.tenantId,
+            id: request.fixedDepositId,
+            ...(request.customerId ? { customer_id: request.customerId } : {}),
+          })
+          .first<{ customer_id: string } | undefined>("customer_id"),
+    );
+    if (!owner) throw new Error("Fixed deposit not found");
+    const input = { ...request, customerId: owner.customer_id };
     const priorMaturity = await withTenantTransaction(
       this.database,
       input.tenantId,
       (trx) =>
-        trx("fixed_deposit_maturities")
-          .where({
-            tenant_id: input.tenantId,
-            idempotency_key: input.idempotencyKey,
-            fixed_deposit_id: input.fixedDepositId,
+        trx("fixed_deposit_maturities as m")
+          .join("fixed_deposits as f", function () {
+            this.on("f.tenant_id", "=", "m.tenant_id").andOn(
+              "f.id",
+              "=",
+              "m.fixed_deposit_id",
+            );
           })
-          .first<Record<string, unknown>>(),
+          .where({
+            "m.tenant_id": input.tenantId,
+            "m.idempotency_key": input.idempotencyKey,
+            "m.fixed_deposit_id": input.fixedDepositId,
+          })
+          .first<Record<string, unknown> | undefined>("m.*", {
+            deposit_status: "f.status",
+          }),
     );
     if (priorMaturity?.status === "SUCCESSFUL") {
       const priorRenewal = await withTenantTransaction(
@@ -707,9 +831,34 @@ export class FixedDepositService {
               renewed_maturity_date: "f.maturity_date",
             }),
       );
-      return priorRenewal
-        ? this.renewedResult(priorRenewal, true)
-        : this.settled("MATURED", priorMaturity, true);
+      if (priorRenewal) return this.renewedResult(priorRenewal, true);
+      if (priorMaturity.deposit_status !== "RENEWED")
+        return this.settled("MATURED", priorMaturity, true);
+      // The principal was released for renewal but the new deposit was not
+      // linked yet: resume the placement under the same derived keys.
+      const resume = await withTenantTransaction(
+        this.database,
+        input.tenantId,
+        async (trx) => ({
+          deposit: await trx("fixed_deposits")
+            .where({ tenant_id: input.tenantId, id: input.fixedDepositId })
+            .first<Record<string, unknown>>(),
+          instruction: await trx("fixed_deposit_instructions")
+            .where({
+              tenant_id: input.tenantId,
+              id: priorMaturity.instruction_id,
+            })
+            .first<Record<string, unknown>>(),
+        }),
+      );
+      if (!resume.deposit || !resume.instruction)
+        throw new Error("Fixed-deposit renewal context not found");
+      return this.renew(
+        input,
+        resume.deposit,
+        resume.instruction,
+        this.settled("RENEWED", priorMaturity, true),
+      );
     }
     const state = await withTenantTransaction(
       this.database,
@@ -771,6 +920,7 @@ export class FixedDepositService {
     },
     deposit: Record<string, unknown>,
     instruction: Record<string, unknown>,
+    priorSettlement?: ReturnType<FixedDepositService["settled"]>,
   ) {
     const tenureDays = Number(instruction.renewal_tenure_days);
     const interestMinor = new Decimal(String(deposit.interest_amount))
@@ -821,7 +971,7 @@ export class FixedDepositService {
       correlationId: input.correlationId,
       idempotencyKey: `renew:${input.idempotencyKey}:quote`,
     });
-    const settlement = await this.settle("RENEWED", input);
+    const settlement = priorSettlement ?? (await this.settle("RENEWED", input));
     const created = await this.create({
       tenantId: input.tenantId,
       customerId: input.customerId,
@@ -980,18 +1130,16 @@ export class FixedDepositService {
           throw new Error("Matured fixed deposit must use maturity processing");
         if (kind === "LIQUIDATED" && deposit.early_liquidation_allowed !== true)
           throw new Error("Early liquidation is disabled");
-        const interest = new Decimal(String(deposit.interest_amount))
-          .mul(100)
-          .toDecimalPlaces(0, Decimal.ROUND_HALF_EVEN)
-          .toFixed(0);
-        const penalty =
-          kind === "LIQUIDATED"
-            ? new Decimal(String(deposit.principal_amount))
-                .mul(String(deposit.early_liquidation_penalty_rate))
-                .div(100)
-                .toDecimalPlaces(0, Decimal.ROUND_HALF_EVEN)
-                .toFixed(0)
-            : "0";
+        // Liquidation pays exactly what the customer accepted in the quote.
+        const interest = settlementQuote
+          ? scalarString(settlementQuote.expected_interest_minor)
+          : new Decimal(String(deposit.interest_amount))
+              .mul(100)
+              .toDecimalPlaces(0, Decimal.ROUND_HALF_EVEN)
+              .toFixed(0);
+        const penalty = settlementQuote
+          ? scalarString(settlementQuote.penalty_minor)
+          : "0";
         const id = randomUUID();
         if (kind === "LIQUIDATED")
           await trx(table).insert({
@@ -1222,7 +1370,7 @@ export class FixedDepositService {
       fixedDepositId: String(row.id),
       principalMinor: String(row.principal_amount),
       interestRate: String(row.interest_rate),
-      maturityDate: String(row.maturity_date),
+      maturityDate: dateOnly(row.maturity_date),
       currency: "NGN" as const,
       status: "ACTIVE" as const,
       ledgerTransactionId: String(row.ledger_transaction_id),

@@ -57,14 +57,16 @@ export async function up(knex: Knex): Promise<void> {
     DECLARE a savings_accounts%ROWTYPE; g savings_goals%ROWTYPE;
     BEGIN
       IF TG_OP='DELETE' THEN RAISE EXCEPTION 'Recurring plans cannot be deleted'; END IF;
-      SELECT * INTO a FROM savings_accounts WHERE tenant_id=NEW.tenant_id AND id=NEW.savings_account_id;
-      IF NOT FOUND OR a.customer_id<>NEW.customer_id OR a.currency<>NEW.currency OR a.status<>'ACTIVE' OR a.product_type NOT IN ('ORDINARY','TARGET')
-      THEN RAISE EXCEPTION 'Recurring plan requires an active customer-owned savings account'; END IF;
-      IF (a.product_type='TARGET')<>(NEW.goal_id IS NOT NULL) THEN RAISE EXCEPTION 'Target recurring plan requires goal'; END IF;
-      IF NEW.goal_id IS NOT NULL THEN
-        SELECT * INTO g FROM savings_goals WHERE tenant_id=NEW.tenant_id AND id=NEW.goal_id;
-        IF NOT FOUND OR g.savings_account_id<>NEW.savings_account_id OR g.customer_id<>NEW.customer_id OR g.status<>'ACTIVE'
-        THEN RAISE EXCEPTION 'Recurring goal must be active and match account/customer'; END IF;
+      IF TG_OP='INSERT' OR (NEW.status='ACTIVE' AND OLD.status<>'ACTIVE') THEN
+        SELECT * INTO a FROM savings_accounts WHERE tenant_id=NEW.tenant_id AND id=NEW.savings_account_id;
+        IF NOT FOUND OR a.customer_id<>NEW.customer_id OR a.currency<>NEW.currency OR a.status<>'ACTIVE' OR a.product_type NOT IN ('ORDINARY','TARGET')
+        THEN RAISE EXCEPTION 'Recurring plan requires an active customer-owned savings account'; END IF;
+        IF (a.product_type='TARGET')<>(NEW.goal_id IS NOT NULL) THEN RAISE EXCEPTION 'Target recurring plan requires goal'; END IF;
+        IF NEW.goal_id IS NOT NULL THEN
+          SELECT * INTO g FROM savings_goals WHERE tenant_id=NEW.tenant_id AND id=NEW.goal_id;
+          IF NOT FOUND OR g.savings_account_id<>NEW.savings_account_id OR g.customer_id<>NEW.customer_id OR g.status<>'ACTIVE'
+          THEN RAISE EXCEPTION 'Recurring goal must be active and match account/customer'; END IF;
+        END IF;
       END IF;
       IF TG_OP='UPDATE' THEN
         IF (NEW.tenant_id,NEW.id,NEW.savings_account_id,NEW.customer_id,NEW.goal_id,NEW.amount,NEW.currency,NEW.frequency,NEW.start_date,NEW.end_date,NEW.max_executions,NEW.source_account_id,NEW.funding_source,NEW.timezone_name,NEW.execution_time,NEW.retry_limit,NEW.creation_idempotency_key,NEW.creation_request_hash,NEW.consent_reference,NEW.schedule_snapshot)

@@ -133,6 +133,10 @@ export class InterestService {
         account = { ...account, calculation_method: "FIXED" };
       if (!account)
         throw new Error("Eligible savings account and rate not found");
+      if (input.accrualDate > this.clock().toISOString().slice(0, 10))
+        throw new Error("Interest cannot be accrued for a future date");
+      if (input.accrualDate < utcDate(account.opened_at))
+        throw new Error("Interest cannot be accrued before the account opened");
       const days =
         String(account.day_count_basis) === "ACT_ACT" &&
         isLeap(Number(input.accrualDate.slice(0, 4)))
@@ -240,7 +244,24 @@ export class InterestService {
         if (existing) {
           if (existing.request_hash !== requestHash)
             throw new Error("Interest-payment idempotency conflict");
-          return { payment: existing, account: null, allocations: [] };
+          const stored = await trx<Record<string, unknown>>(
+            "savings_interest_payment_accruals",
+          ).where({
+            tenant_id: input.tenantId,
+            interest_payment_id: existing.id,
+          });
+          return {
+            payment: existing,
+            account: null,
+            allocations: stored.map((item) => ({
+              row: {
+                id: item.interest_accrual_id,
+                interest_amount: item.allocated_unrounded,
+              },
+              minor: scalarString(item.allocated_minor),
+            })),
+            batch: { id: existing.payment_batch_id },
+          };
         }
         const account = await trx("savings_accounts")
           .where({
@@ -262,6 +283,21 @@ export class InterestService {
             posted: false,
           })
           .whereBetween("accrual_date", [input.periodStart, input.periodEnd])
+          // Skip accruals already claimed by a payment that is still live.
+          .whereNotExists(function () {
+            this.select(trx.raw("1"))
+              .from("savings_interest_payment_accruals as pa")
+              .join("savings_interest_payments as p", function () {
+                this.on("p.tenant_id", "=", "pa.tenant_id").andOn(
+                  "p.id",
+                  "=",
+                  "pa.interest_payment_id",
+                );
+              })
+              .whereRaw("pa.tenant_id = savings_interest_accruals.tenant_id")
+              .whereRaw("pa.interest_accrual_id = savings_interest_accruals.id")
+              .whereNotIn("p.status", ["CANCELLED", "REVERSED"]);
+          })
           .orderBy("accrual_date")
           .forUpdate();
         if (accruals.length === 0)
@@ -491,6 +527,10 @@ function hash(value: unknown) {
 function dateOnly(value: unknown) {
   if (!(value instanceof Date)) return String(value).slice(0, 10);
   return `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, "0")}-${String(value.getDate()).padStart(2, "0")}`;
+}
+function utcDate(value: unknown) {
+  if (value instanceof Date) return value.toISOString().slice(0, 10);
+  return String(value).slice(0, 10);
 }
 function isLeap(year: number) {
   return year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);

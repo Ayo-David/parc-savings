@@ -256,8 +256,9 @@ describeDatabase("SV-04 fixed deposits", () => {
     const events = await database("savings_outbox_events").where({
       tenant_id: tenantId,
       aggregate_type: "fixed_deposit",
+      aggregate_id: id,
     });
-    expect(events).toHaveLength(4);
+    expect(events).toHaveLength(2);
   });
 
   it.each([

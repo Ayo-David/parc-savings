@@ -208,7 +208,7 @@ describeDatabase("SV-05 recurring wallet contributions", () => {
       .where({ id: planId })
       .first<Record<string, unknown>>();
     expect(plan).toMatchObject({ execution_count: 1, status: "ACTIVE" });
-    expect(plan?.next_execution_date).toEqual(new Date(2026, 9, 13));
+    expect(plan?.next_execution_date).toBe("2026-10-13");
     const executions = await database("savings_recurring_executions").where({
       recurring_plan_id: planId,
     });
@@ -266,6 +266,6 @@ describeDatabase("SV-05 recurring wallet contributions", () => {
       .where({ id: planId })
       .first<Record<string, unknown>>();
     expect(plan).toMatchObject({ execution_count: 1, status: "ACTIVE" });
-    expect(plan?.next_execution_date).toEqual(new Date(2026, 8, 14));
+    expect(plan?.next_execution_date).toBe("2026-09-14");
   });
 });

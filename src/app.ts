@@ -14,6 +14,7 @@ import type { RecurringContributionService } from "./services/recurring-contribu
 import type { InterestService } from "./services/interest-service.js";
 import type { SavingsSummaryService } from "./services/savings-summary-service.js";
 import {
+  ParcAuthError,
   principalOf,
   type AccessPolicy,
 } from "./security/parc-service-auth.js";
@@ -565,7 +566,7 @@ export function createApp(
   );
   app.post(
     "/internal/v1/fixed-deposits/:id/mature",
-    access.require(savingsAccessPolicies.customerWrite),
+    access.require(savingsAccessPolicies.operations),
     route(async (request, response) => {
       if (!fixedDeposits)
         throw new Error("Fixed-deposit handler is unavailable");
@@ -573,7 +574,6 @@ export function createApp(
       const input = fixedDepositSettlementInput.parse(request.body);
       const result = await fixedDeposits.mature({
         tenantId: principal.tenantId,
-        customerId: principal.subjectId,
         fixedDepositId: z.string().uuid().parse(request.params.id),
         currency: input.currency,
         correlationId: input.correlation_id,
@@ -787,20 +787,26 @@ export function createApp(
         return response
           .status(400)
           .json({ code: "INVALID_REQUEST", details: error.flatten() });
+      if (error instanceof ParcAuthError)
+        return response.status(error.status).json({ code: error.code });
+      // Services raise plain Errors for intentional domain rejections; anything
+      // else (database, network, programming errors) is unexpected.
+      if (!(error instanceof Error) || error.constructor !== Error) {
+        console.error(error);
+        return response.status(500).json({ code: "INTERNAL_ERROR" });
+      }
+      if (/(identity|context) mismatch/.test(error.message))
+        return response.status(403).json({ code: error.message });
       return response
         .status(
-          error instanceof Error && error.message.includes("not found")
+          error.message.includes("not found")
             ? 404
-            : error instanceof Error &&
-                (error.message.includes("Idempotency") ||
-                  error.message.includes("conflict"))
+            : error.message.includes("Idempotency") ||
+                error.message.includes("conflict")
               ? 409
               : 422,
         )
-        .json({
-          code:
-            error instanceof Error ? error.message : "SAVINGS_COMMAND_FAILED",
-        });
+        .json({ code: error.message });
     },
   );
   return app;

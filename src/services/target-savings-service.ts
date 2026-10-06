@@ -53,7 +53,15 @@ export class TargetSavingsService {
           target_date: string;
           status: string;
           creation_request_hash: string;
-        }>();
+        }>(
+          "id",
+          "savings_account_id",
+          "target_amount",
+          "currency",
+          trx.raw("to_char(target_date,'YYYY-MM-DD') AS target_date"),
+          "status",
+          "creation_request_hash",
+        );
       if (existing) {
         if (existing.creation_request_hash !== requestHash)
           throw new Error("Goal-creation idempotency conflict");
@@ -62,7 +70,7 @@ export class TargetSavingsService {
           savingsAccountId: existing.savings_account_id,
           targetAmountMinor: existing.target_amount,
           currency: "NGN",
-          targetDate: String(existing.target_date),
+          targetDate: existing.target_date,
           status: "ACTIVE",
           replayed: true,
         };
@@ -240,20 +248,31 @@ export class TargetSavingsService {
             savings_account_id: string;
             current_amount: string;
             accrued_interest: string;
-            target_date: string;
+            matured: boolean;
             partial_withdrawal_count: number;
             ledger_account_id: string;
           }>(
             "g.savings_account_id",
             "g.current_amount",
             "g.accrued_interest",
-            "g.target_date",
+            trx.raw(
+              "g.target_date <= (now() AT TIME ZONE 'UTC')::date AS matured",
+            ),
             "g.partial_withdrawal_count",
             "a.ledger_account_id",
           );
         if (!goal) throw new Error("Active target savings goal not found");
-        if (new Date(`${String(goal.target_date)}T00:00:00.000Z`) <= new Date())
+        if (goal.matured)
           throw new Error("Matured target savings cannot use early withdrawal");
+        // The goal row is locked, so this check is atomic across kinds.
+        const pending = await trx("savings_goal_withdrawals")
+          .where({
+            tenant_id: input.tenantId,
+            goal_id: input.goalId,
+            status: "PENDING",
+          })
+          .first<{ id: string } | undefined>("id");
+        if (pending) throw new Error("A goal withdrawal is already pending");
         const current = BigInt(goal.current_amount);
         const amount =
           kind === "BREAK" ? current : BigInt(input.amountMinor ?? "0");
@@ -406,11 +425,17 @@ export class TargetSavingsService {
         await trx("savings_accounts")
           .where({ tenant_id: input.tenantId, id: context.savings_account_id })
           .update({
-            current_balance: balance.postedBalanceMinor,
-            held_balance: balance.heldBalanceMinor,
             total_withdrawn: trx.raw("total_withdrawn + ?::bigint", [
               prepared.operation.amount,
             ]),
+          });
+        // A concurrent operation may already have stored a newer ledger snapshot.
+        await trx("savings_accounts")
+          .where({ tenant_id: input.tenantId, id: context.savings_account_id })
+          .where("last_ledger_sequence", "<", balance.version)
+          .update({
+            current_balance: balance.postedBalanceMinor,
+            held_balance: balance.heldBalanceMinor,
             last_ledger_sequence: balance.version,
             ledger_synced_at: trx.fn.now(),
           });

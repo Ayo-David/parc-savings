@@ -304,8 +304,19 @@ export class OrdinarySavingsService {
               customer_id: input.customerId,
               status: "ACTIVE",
             })
+            .forUpdate()
             .first<{ id: string }>();
           if (!goal) throw new Error("Active target savings goal not found");
+          const pendingBreak = await trx("savings_goal_withdrawals")
+            .where({
+              tenant_id: input.tenantId,
+              goal_id: input.goalId,
+              status: "PENDING",
+              withdrawal_kind: "BREAK",
+            })
+            .first<{ id: string } | undefined>("id");
+          if (pendingBreak)
+            throw new Error("Goal is being broken; contributions are closed");
         }
         if (BigInt(input.amountMinor) < BigInt(account.minimum_deposit))
           throw new Error("Contribution is below the product minimum");
@@ -406,11 +417,17 @@ export class OrdinarySavingsService {
         await trx("savings_accounts")
           .where({ tenant_id: input.tenantId, id: input.accountId })
           .update({
-            current_balance: balance.postedBalanceMinor,
-            held_balance: balance.heldBalanceMinor,
             total_deposited: trx.raw("total_deposited + ?::bigint", [
               input.amountMinor,
             ]),
+          });
+        // A concurrent operation may already have stored a newer ledger snapshot.
+        await trx("savings_accounts")
+          .where({ tenant_id: input.tenantId, id: input.accountId })
+          .where("last_ledger_sequence", "<", balance.version)
+          .update({
+            current_balance: balance.postedBalanceMinor,
+            held_balance: balance.heldBalanceMinor,
             last_ledger_sequence: balance.version,
             ledger_synced_at: trx.fn.now(),
           });

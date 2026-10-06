@@ -90,7 +90,7 @@ export async function up(knex: Knex): Promise<void> {
       SELECT * INTO a FROM savings_interest_accruals WHERE tenant_id=NEW.tenant_id AND id=NEW.interest_accrual_id FOR UPDATE;
       IF p.id IS NULL OR a.id IS NULL OR p.settlement_basis<>'ACCRUED' OR p.status IN ('SUCCESSFUL','REVERSED','CANCELLED') OR a.posted
         OR a.savings_account_id<>p.savings_account_id OR a.currency<>p.currency OR a.accrual_date<p.payment_period_start OR a.accrual_date>p.payment_period_end
-        OR NEW.allocated_unrounded<>a.interest_amount OR NEW.allocated_minor<>round(a.interest_amount)::bigint
+        OR NEW.allocated_unrounded<>a.interest_amount OR NEW.allocated_minor<>(CASE WHEN a.interest_amount-floor(a.interest_amount)=0.5 THEN floor(a.interest_amount)+mod(floor(a.interest_amount),2) ELSE round(a.interest_amount) END)::bigint
       THEN RAISE EXCEPTION 'Interest allocation does not match eligible accrual'; END IF;
       RETURN NEW;
     END $fn$;
